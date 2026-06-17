@@ -4,29 +4,27 @@ A public, multi-server Discord moderation & security bot for incident response
 and server hardening. Anyone can invite it to their own server — it stores no
 per-server config and works out of the box.
 
-All commands are triggered by **@mentioning the bot** (e.g.
-`@Bams Modmin Tools help`). Mention-only invocation means the bot never clashes
-with other bots' commands, and it works **without** the privileged Message
-Content intent.
+Commands are modern **slash commands** (`/`) — they autocomplete, validate
+arguments, and are hidden in the picker from members who lack the Administrator
+permission.
 
-**[➕ Add to your server](https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot&permissions=805399604)**
+**[➕ Add to your server](https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot+applications.commands&permissions=805399604)**
 · [Terms of Service](https://brandoncox-commits.github.io/discord-security-bot/terms-of-service)
 · [Privacy Policy](https://brandoncox-commits.github.io/discord-security-bot/privacy-policy)
 
 ## Commands
 
-Mention the bot, then the command. All commands require the **Administrator**
-permission.
+All commands require the **Administrator** permission.
 
 | Command | What it does |
 |---|---|
-| `@bot help` | Lists every command and what it does. |
-| `@bot bulk-purge-user <user>` | Bans the user, deletes their messages from the last 14 days across all channels & threads, and removes any webhooks they created plus those webhooks' messages. |
-| `@bot audit-permissions` | Audits every role, `@everyone`, and all integrations/apps for dangerous permissions. Colour-coded embed. |
-| `@bot purge-webhooks` | Deletes every webhook in the server (closes spam backdoors). Logs names to `#mod-logs`. |
-| `@bot panic <lock\|unlock>` | Freezes/unfreezes all text channels for `@everyone` during a raid. |
-| `@bot wipe-invites` | Revokes all active invite links so banned users can't rejoin. |
-| `@bot trace-app <app> [scan_messages]` | Finds the human(s) behind an app/bot — the integration installer and/or whoever invoked a user-installed app to post — so you can `bulk-purge-user` them. Report-only. |
+| `/help` | Lists every command and what it does. |
+| `/bulk-purge-user <user>` | Bans the user, deletes their messages from the last 14 days across all channels & threads, and removes any webhooks they created plus those webhooks' messages. |
+| `/audit-permissions` | Audits every role, `@everyone`, and all integrations/apps for dangerous permissions. Colour-coded embed. |
+| `/purge-webhooks` | Deletes every webhook in the server (closes spam backdoors). Logs names to `#mod-logs`. |
+| `/panic <lock\|unlock>` | Freezes/unfreezes all text channels for `@everyone` during a raid. |
+| `/wipe-invites` | Revokes all active invite links so banned users can't rejoin. |
+| `/trace-app <app> [scan_messages]` | Finds the human(s) behind an app/bot — the integration installer and/or whoever invoked a user-installed app to post — so you can `/bulk-purge-user` them. Report-only. |
 
 ### `panic` lock/unlock behaviour
 
@@ -43,9 +41,9 @@ refused until you unlock (to protect the saved state).
 Discord exposes two reliable links from a malicious app to a person:
 its **integration installer** (`integration.user`) and, for user-installed
 apps, the **invoker** recorded on each message (`interaction_metadata.user`).
-`trace-app` gathers both and reports candidate user IDs; it does **not** ban
+`/trace-app` gathers both and reports candidate user IDs; it does **not** ban
 automatically (a false match shouldn't nuke an innocent user). Confirm, then run
-`bulk-purge-user`. Classic bots that post on their own (no interaction) may only
+`/bulk-purge-user`. Classic bots that post on their own (no interaction) may only
 be traceable via Server Settings → Integrations.
 
 ## How logging works (multi-server friendly)
@@ -59,20 +57,24 @@ setup or database required.
 
 1. **Create the application** at <https://discord.com/developers/applications>.
    - Under **Bot**, copy the token.
-   - Enable the **Server Members Intent** (Privileged Gateway Intents).
-   - The Message Content intent is **not** required — commands are mention-only.
+   - Enable the **Server Members Intent** (Privileged Gateway Intents). The
+     Message Content and Presence intents are **not** required.
+   - Under **Installation**, enable **Guild Install** with scopes
+     `bot` + `applications.commands`.
 2. **Configure & run:**
    ```bash
    cp .env.example .env        # then paste your BOT_TOKEN
    pip install -r requirements.txt
    python bot.py
    ```
+   Leave `DEV_GUILD_ID` blank for global command sync. Set it to a server ID to
+   sync commands to that one server instantly (useful while testing).
 
 ## Install link (server admins)
 
 **Least-privilege (recommended):**
 ```
-https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot&permissions=805399604
+https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot+applications.commands&permissions=805399604
 ```
 That permission integer grants exactly what the commands need:
 View Channels, Send Messages, Embed Links, Read Message History,
@@ -98,7 +100,7 @@ least-privilege is preferred.
 ## Notes & limits
 
 - **14-day window:** Discord only allows *bulk* message deletion for messages
-  younger than 14 days. `bulk-purge-user` deliberately ignores older messages
+  younger than 14 days. `/bulk-purge-user` deliberately ignores older messages
   to stay fast and within API rate limits.
 - **Graceful degradation:** every command reports how many channels/items it
   had to skip due to missing permissions instead of failing outright.
