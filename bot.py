@@ -82,6 +82,9 @@ DANGEROUS_PERMISSIONS = (
     "manage_messages",
     "mention_everyone",
     "moderate_members",
+    # Lets members invoke user-installed apps in the server — the vector behind
+    # user-app spam (e.g. gore-image apps). Dangerous on @everyone especially.
+    "use_external_apps",
 )
 
 # --------------------------------------------------------------------------- #
