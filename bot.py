@@ -70,22 +70,135 @@ PANIC_PERMS = (
     "send_messages_in_threads",
 )
 
-# Permissions considered dangerous when granted to a role / @everyone.
-DANGEROUS_PERMISSIONS = (
-    "administrator",
-    "manage_guild",
-    "manage_webhooks",
-    "manage_roles",
-    "manage_channels",
-    "ban_members",
-    "kick_members",
-    "manage_messages",
-    "mention_everyone",
-    "moderate_members",
-    # Lets members invoke user-installed apps in the server — the vector behind
-    # user-app spam (e.g. gore-image apps). Dangerous on @everyone especially.
-    "use_external_apps",
-)
+# --- Permission risk model -------------------------------------------------- #
+# Tiered model based on a Discord permission risk breakdown plus Discord's own
+# guidance (sources listed in the README). Danger tiers, most to least severe.
+RISK_CRITICAL = "Critical"
+RISK_EXTREME = "Extreme"
+RISK_HIGH = "High"
+RISK_MEDIUM = "Medium"
+RISK_LOW = "Low"
+
+RISK_ORDER = {RISK_CRITICAL: 4, RISK_EXTREME: 3, RISK_HIGH: 2, RISK_MEDIUM: 1, RISK_LOW: 0}
+RISK_EMOJI = {
+    RISK_CRITICAL: "🟣",
+    RISK_EXTREME: "🔴",
+    RISK_HIGH: "🟠",
+    RISK_MEDIUM: "🟡",
+    RISK_LOW: "⚪",
+}
+
+# Friendly names matching Discord's UI where it differs from the API flag.
+PERM_DISPLAY = {
+    "manage_guild": "Manage Server",
+    "moderate_members": "Timeout Members",
+    "use_external_apps": "Use External Apps",
+    "mention_everyone": "Mention @everyone / @here",
+    "manage_expressions": "Manage Expressions (emoji/stickers)",
+    "create_expressions": "Create Expressions",
+    "create_instant_invite": "Create Invite",
+}
+
+# flag -> (risk tier, why it's risky / abuse potential, recommended placement)
+PERMISSION_RISK: dict[str, tuple[str, str, str]] = {
+    "administrator": (
+        RISK_CRITICAL,
+        "Grants every permission and bypasses all channel/role overrides. One "
+        "compromised holder can delete channels, ban everyone, or add malicious bots.",
+        "Server owner only",
+    ),
+    "manage_guild": (
+        RISK_EXTREME,
+        "Can add bots/apps and change server & AutoMod settings — used to plant a "
+        "nuke bot or strip moderation rules.",
+        "Admin",
+    ),
+    "manage_roles": (
+        RISK_EXTREME,
+        "Can edit/delete lower roles and grant dangerous permissions to others — a "
+        "direct privilege-escalation path.",
+        "Admin",
+    ),
+    "manage_channels": (
+        RISK_EXTREME,
+        "Can delete every channel and category — irreversible.",
+        "Admin",
+    ),
+    "manage_webhooks": (
+        RISK_EXTREME,
+        "Webhooks bypass AutoMod and can spam @everyone pings and scam links — a "
+        "prime raid/scam vector that persists after an app is removed.",
+        "Admin",
+    ),
+    "ban_members": (
+        RISK_HIGH,
+        "Can maliciously remove (and bar the return of) key members.",
+        "Admin",
+    ),
+    "kick_members": (
+        RISK_HIGH,
+        "Can disrupt the community or mass-remove members via Prune.",
+        "Moderator / Admin",
+    ),
+    "mention_everyone": (
+        RISK_HIGH,
+        "Can ping the whole server — the core tool of mention raids.",
+        "Admin",
+    ),
+    "manage_messages": (
+        RISK_HIGH,
+        "Can delete others' messages and wipe channel history — irreversible, and can "
+        "silently censor users.",
+        "Moderator / Admin",
+    ),
+    "use_external_apps": (
+        RISK_HIGH,
+        "Lets members invoke user-installed apps in the server — the vector behind "
+        "user-app spam (e.g. gore-image apps). High risk on @everyone.",
+        "Restrict on @everyone",
+    ),
+    "moderate_members": (
+        RISK_MEDIUM,
+        "Timeout members — a core mod tool, but can be abused to silence users.",
+        "Moderator / Admin",
+    ),
+    "manage_threads": (
+        RISK_MEDIUM,
+        "Can delete or lock other members' threads.",
+        "Moderator / Admin",
+    ),
+    "manage_nicknames": (
+        RISK_MEDIUM,
+        "Can rename members — used for harassment or impersonation.",
+        "Moderator / Admin",
+    ),
+    "manage_events": (
+        RISK_LOW,
+        "Can edit/delete scheduled server events.",
+        "Moderator / Admin",
+    ),
+    "manage_expressions": (
+        RISK_LOW,
+        "Can add/remove emojis, stickers, and soundboard sounds.",
+        "Moderator / Admin",
+    ),
+}
+
+
+def perm_name(flag: str) -> str:
+    """Human-friendly permission name matching Discord's UI."""
+    return PERM_DISPLAY.get(flag, flag.replace("_", " ").title())
+
+
+def assess_permissions(permissions: discord.Permissions) -> list[tuple[str, str, str, str]]:
+    """Return (flag, risk, why, recommended) for risky perms present, worst first."""
+    found: list[tuple[str, str, str, str]] = []
+    for flag, value in permissions:
+        if value and flag in PERMISSION_RISK:
+            risk, why, rec = PERMISSION_RISK[flag]
+            found.append((flag, risk, why, rec))
+    found.sort(key=lambda f: RISK_ORDER[f[1]], reverse=True)
+    return found
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -372,21 +485,23 @@ async def audit_permissions(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(thinking=True, ephemeral=True)
 
-    risky_roles: list[str] = []
-    everyone_risks: list[str] = []
+    # @everyone is the highest-impact surface: every member inherits it.
+    everyone_found = assess_permissions(guild.default_role.permissions)
 
+    role_findings: list[tuple[discord.Role, list]] = []
     for role in guild.roles:
-        granted = [
-            perm for perm, value in role.permissions if value and perm in DANGEROUS_PERMISSIONS
-        ]
-        if not granted:
+        if role.is_default():
             continue
-        pretty = ", ".join(p.replace("_", " ").title() for p in granted)
-        if role.is_default():  # @everyone
-            everyone_risks.append(pretty)
-        else:
-            risky_roles.append(f"**{role.name}** ({len(role.members)} member(s)): {pretty}")
+        found = assess_permissions(role.permissions)
+        if found:
+            role_findings.append((role, found))
+    # Worst tier first, then by how many members are affected.
+    role_findings.sort(
+        key=lambda rf: (max(RISK_ORDER[f[1]] for f in rf[1]), len(rf[0].members)),
+        reverse=True,
+    )
 
+    # Integrations / apps, flagging any whose managed role carries risky perms.
     integration_lines: list[str] = []
     try:
         for integ in await guild.integrations():
@@ -395,13 +510,11 @@ async def audit_permissions(interaction: discord.Interaction) -> None:
             flagged = ""
             role_obj = getattr(integ, "role", None)
             if role_obj is not None:
-                role_perms = [
-                    p.replace("_", " ").title()
-                    for p, v in role_obj.permissions
-                    if v and p in DANGEROUS_PERMISSIONS
-                ]
-                if role_perms:
-                    flagged = f" ⚠️ {', '.join(role_perms)}"
+                ifound = assess_permissions(role_obj.permissions)
+                if ifound:
+                    top = ifound[0][1]
+                    names = ", ".join(perm_name(f[0]) for f in ifound)
+                    flagged = f" {RISK_EMOJI[top]} {names}"
             integration_lines.append(
                 f"• **{integ.name}** ({integ.type}) — account: {account_name}{flagged}"
             )
@@ -410,55 +523,92 @@ async def audit_permissions(interaction: discord.Interaction) -> None:
     except discord.HTTPException as exc:
         integration_lines.append(f"_Failed to fetch integrations: {exc}_")
 
-    critical = bool(everyone_risks) or bool(risky_roles)
+    # Tally findings by tier for the summary line.
+    tally: dict[str, int] = {}
+    for _flag, risk, _why, _rec in everyone_found:
+        tally[risk] = tally.get(risk, 0) + 1
+    for _role, found in role_findings:
+        for _flag, risk, _why, _rec in found:
+            tally[risk] = tally.get(risk, 0) + 1
+
+    everyone_max = max((RISK_ORDER[f[1]] for f in everyone_found), default=-1)
+    roles_max = max((RISK_ORDER[f[1]] for _r, found in role_findings for f in found), default=-1)
+    if everyone_max >= RISK_ORDER[RISK_HIGH] or roles_max >= RISK_ORDER[RISK_EXTREME]:
+        color = discord.Color.red()
+    elif everyone_found or role_findings:
+        color = discord.Color.orange()
+    else:
+        color = discord.Color.green()
+
+    summary = (
+        " · ".join(
+            f"{RISK_EMOJI[t]} {tally[t]} {t}"
+            for t in (RISK_CRITICAL, RISK_EXTREME, RISK_HIGH, RISK_MEDIUM, RISK_LOW)
+            if tally.get(t)
+        )
+        or "No risky permissions found. ✅"
+    )
+
     embed = discord.Embed(
         title=f"🔐 Permission & Risk Audit — {guild.name}",
-        color=discord.Color.red() if critical else discord.Color.green(),
+        description=f"**Findings:** {summary}",
+        color=color,
         timestamp=utcnow(),
     )
 
-    if everyone_risks:
-        embed.add_field(
-            name="🚨 @everyone has dangerous permissions",
-            value="\n".join(f"`{r}`" for r in everyone_risks),
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="✅ @everyone", value="No dangerous permissions granted.", inline=False
-        )
-
-    if risky_roles:
+    def add_lines_field(title: str, lines: list[str], empty_msg: str) -> None:
+        if not lines:
+            embed.add_field(name=title, value=empty_msg, inline=False)
+            return
         chunk = ""
-        idx = 1
-        for line in risky_roles:
+        name = title
+        cont = 1
+        for line in lines:
+            line = line[:1000]
             if len(chunk) + len(line) + 1 > 1000:
-                embed.add_field(
-                    name=f"⚠️ Roles with dangerous permissions ({idx})",
-                    value=chunk or "—",
-                    inline=False,
-                )
+                embed.add_field(name=name, value=chunk, inline=False)
                 chunk = ""
-                idx += 1
+                cont += 1
+                name = f"{title} (cont. {cont})"
             chunk += line + "\n"
         if chunk:
-            embed.add_field(
-                name=f"⚠️ Roles with dangerous permissions ({idx})",
-                value=chunk,
-                inline=False,
-            )
-    else:
-        embed.add_field(
-            name="✅ Roles",
-            value="No non-default roles hold dangerous permissions.",
-            inline=False,
+            embed.add_field(name=name, value=chunk, inline=False)
+
+    everyone_lines = [
+        f"{RISK_EMOJI[risk]} **{perm_name(flag)}** ({risk}) — {why}"
+        for flag, risk, why, _rec in everyone_found
+    ]
+    add_lines_field(
+        "🚨 @everyone — inherited by EVERY member",
+        everyone_lines,
+        "✅ No risky permissions granted to @everyone.",
+    )
+
+    role_lines = []
+    for role, found in role_findings[:40]:
+        top = found[0][1]
+        perms_str = ", ".join(f"{perm_name(f[0])} {RISK_EMOJI[f[1]]}" for f in found)
+        role_lines.append(
+            f"{RISK_EMOJI[top]} **{role.name}** ({len(role.members)} member(s)): {perms_str}"
         )
+    if len(role_findings) > 40:
+        role_lines.append(f"… and {len(role_findings) - 40} more role(s).")
+    add_lines_field(
+        "⚠️ Roles holding elevated permissions",
+        role_lines,
+        "✅ No non-default roles hold risky permissions.",
+    )
 
     integ_value = "\n".join(integration_lines) if integration_lines else "None found."
     if len(integ_value) > 1024:
         integ_value = integ_value[:1000] + "\n… (truncated)"
     embed.add_field(name="🔌 Integrations & Apps", value=integ_value, inline=False)
 
+    embed.add_field(
+        name="Legend",
+        value="🟣 Critical · 🔴 Extreme · 🟠 High · 🟡 Medium · ⚪ Low",
+        inline=False,
+    )
     embed.set_footer(text=f"Requested by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
     await send_mod_log(guild, embed)
