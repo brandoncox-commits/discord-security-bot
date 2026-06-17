@@ -749,7 +749,10 @@ async def trace_app(
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    # Ephemeral: trace results can include innocent/unconfirmed user IDs, so only
+    # the admin who ran the command should see them (an audit copy still goes to
+    # #mod-logs). Deferring ephemerally makes the followups ephemeral too.
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     candidates: dict[int, dict] = {}
 
@@ -807,7 +810,8 @@ async def trace_app(
             f"🔍 Couldn't link **{app}** (`{app.id}`) to a specific user.\n"
             "• If it's a classic bot, check **Server Settings → Integrations** for who added it.\n"
             "• User-installed apps only reveal an invoker on messages they posted via an "
-            "interaction — try again after it posts."
+            "interaction — try again after it posts.",
+            ephemeral=True,
         )
         return
 
@@ -826,7 +830,7 @@ async def trace_app(
         extra = f" — {data['messages']} message(s)" if data["messages"] else ""
         embed.add_field(name=f"{user} (`{uid}`)", value=f"{reasons}{extra}", inline=False)
     embed.set_footer(text=f"Scanned {scanned_channels} channel(s) • by {interaction.user}")
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
     await send_mod_log(guild, embed)
 
 
