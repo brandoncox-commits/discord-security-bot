@@ -4,6 +4,10 @@ A public, multi-server slash-command bot for incident response and server
 hardening. Anyone can invite it to their own server — it stores no per-server
 config and works out of the box.
 
+**[➕ Add to your server](https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot+applications.commands&permissions=805399604)**
+· [Terms of Service](https://brandoncox-commits.github.io/discord-security-bot/terms-of-service)
+· [Privacy Policy](https://brandoncox-commits.github.io/discord-security-bot/privacy-policy)
+
 ## Commands
 
 | Command | What it does |
@@ -63,11 +67,9 @@ setup or database required.
 
 ## Install link (server admins)
 
-Replace `YOUR_CLIENT_ID` with your application's Client ID:
-
 **Least-privilege (recommended):**
 ```
-https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot+applications.commands&permissions=805399604
+https://discord.com/api/oauth2/authorize?client_id=1516798418587222117&scope=bot+applications.commands&permissions=805399604
 ```
 That permission integer grants exactly what the commands need:
 View Channels, Send Messages, Embed Links, Read Message History,
@@ -77,6 +79,14 @@ Manage Server, and Ban Members.
 **Simplest (Administrator):** the original spec calls for high-level admin
 rights. If you'd rather grant a single permission, use `permissions=8`
 (Administrator). This is broader than necessary — least-privilege is preferred.
+
+> Self-hosting your own instance? Replace the `client_id` above with your own
+> application's Client ID (Developer Portal → General Information).
+
+## Legal
+
+- **Terms of Service:** <https://brandoncox-commits.github.io/discord-security-bot/terms-of-service>
+- **Privacy Policy:** <https://brandoncox-commits.github.io/discord-security-bot/privacy-policy>
 
 > The bot's role must sit **above** the roles/members it acts on, or Discord
 > will reject bans and permission edits with a `Forbidden` error. The bot
