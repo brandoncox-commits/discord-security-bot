@@ -248,7 +248,7 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     # 1. Ban first so the user can't keep posting while we clean up.
     try:
@@ -260,11 +260,12 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
     except discord.Forbidden:
         await interaction.followup.send(
             "❌ I lack permission to ban this user. Check my role position and "
-            "`Ban Members` permission."
+            "`Ban Members` permission.",
+            ephemeral=True,
         )
         return
     except discord.HTTPException as exc:
-        await interaction.followup.send(f"❌ Failed to ban user: {exc}")
+        await interaction.followup.send(f"❌ Failed to ban user: {exc}", ephemeral=True)
         return
 
     # 2. Find and remove webhooks created by the target. Malicious apps spam via
@@ -332,7 +333,7 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
         summary += f"\n🧹 Removed **{deleted_webhooks}** webhook(s) created by this user."
     if skipped_channels:
         summary += f"\n⚠️ Skipped {skipped_channels} channel(s) due to missing permissions."
-    await interaction.followup.send(summary)
+    await interaction.followup.send(summary, ephemeral=True)
 
     embed = discord.Embed(
         title="Bulk Purge + Ban",
@@ -366,7 +367,7 @@ async def audit_permissions(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     risky_roles: list[str] = []
     everyone_risks: list[str] = []
@@ -456,7 +457,7 @@ async def audit_permissions(interaction: discord.Interaction) -> None:
     embed.add_field(name="🔌 Integrations & Apps", value=integ_value, inline=False)
 
     embed.set_footer(text=f"Requested by {interaction.user}")
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
     await send_mod_log(guild, embed)
 
 
@@ -480,14 +481,16 @@ async def purge_webhooks(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     deleted_names: list[str] = []
     failed = 0
     try:
         webhooks = await guild.webhooks()
     except discord.Forbidden:
-        await interaction.followup.send("❌ I need the `Manage Webhooks` permission to do this.")
+        await interaction.followup.send(
+            "❌ I need the `Manage Webhooks` permission to do this.", ephemeral=True
+        )
         return
 
     for wh in webhooks:
@@ -502,7 +505,7 @@ async def purge_webhooks(interaction: discord.Interaction) -> None:
     msg = f"🧹 Deleted **{len(deleted_names)}** webhook(s)."
     if failed:
         msg += f" Failed to delete {failed}."
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, ephemeral=True)
 
     embed = discord.Embed(
         title="Webhook Purge",
@@ -542,7 +545,7 @@ async def panic(interaction: discord.Interaction, action: app_commands.Choice[st
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     everyone = guild.default_role
     state = load_panic_state()
@@ -558,7 +561,8 @@ async def _panic_lock(interaction, guild, everyone, state, gid) -> None:
     if gid in state:
         await interaction.followup.send(
             "⚠️ This server already has an active panic lock. Run `/panic unlock` "
-            "first if you want to re-lock."
+            "first if you want to re-lock.",
+            ephemeral=True,
         )
         return
 
@@ -608,7 +612,7 @@ async def _panic_lock(interaction, guild, everyone, state, gid) -> None:
         )
     if failed:
         msg += f"\n⚠️ {failed} channel(s) could not be updated (check my permissions)."
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, ephemeral=True)
 
     embed = discord.Embed(title="Panic Button — LOCK", color=discord.Color.red(), timestamp=utcnow())
     embed.add_field(name="Channels locked", value=str(len(locked)))
@@ -622,7 +626,8 @@ async def _panic_unlock(interaction, guild, everyone, state, gid) -> None:
     saved = state.get(gid)
     if not saved:
         await interaction.followup.send(
-            "ℹ️ No active panic lock recorded for this server, so there's nothing to restore."
+            "ℹ️ No active panic lock recorded for this server, so there's nothing to restore.",
+            ephemeral=True,
         )
         return
 
@@ -656,7 +661,7 @@ async def _panic_unlock(interaction, guild, everyone, state, gid) -> None:
         msg += f"\nℹ️ {skipped} pre-existing read-only channel(s) were left untouched, as recorded."
     if failed:
         msg += f"\n⚠️ {failed} channel(s) could not be updated (check my permissions)."
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, ephemeral=True)
 
     embed = discord.Embed(title="Panic Button — UNLOCK", color=discord.Color.green(), timestamp=utcnow())
     embed.add_field(name="Channels restored", value=str(restored))
@@ -686,12 +691,14 @@ async def wipe_invites(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer(thinking=True, ephemeral=True)
 
     try:
         invites = await guild.invites()
     except discord.Forbidden:
-        await interaction.followup.send("❌ I need the `Manage Server` permission to read invites.")
+        await interaction.followup.send(
+            "❌ I need the `Manage Server` permission to read invites.", ephemeral=True
+        )
         return
 
     deleted = 0
@@ -707,7 +714,7 @@ async def wipe_invites(interaction: discord.Interaction) -> None:
     msg = f"🧨 Deleted **{deleted}** invite link(s). New invites must be generated manually."
     if failed:
         msg += f" ⚠️ Failed to delete {failed}."
-    await interaction.followup.send(msg)
+    await interaction.followup.send(msg, ephemeral=True)
 
     embed = discord.Embed(
         title="Invite Wipe",
