@@ -216,11 +216,35 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
         await interaction.followup.send(f"❌ Failed to ban user: {exc}")
         return
 
-    # 2/3/4. Purge messages newer than 14 days across all text channels & threads.
+    # 2. Find and remove webhooks created by the target. Malicious apps spam via
+    #    webhooks, whose messages have a webhook author (not a user), so deleting
+    #    the webhook also lets us catch its messages by webhook_id below. Scoped
+    #    to webhooks this user created so legitimate integrations are untouched.
+    target_webhook_ids: set[int] = set()
+    deleted_webhooks = 0
+    try:
+        for wh in await guild.webhooks():
+            creator = getattr(wh, "user", None)
+            if creator is not None and creator.id == user.id:
+                target_webhook_ids.add(wh.id)
+                try:
+                    await wh.delete(reason=f"bulk-purge-user: {user} ({user.id})")
+                    deleted_webhooks += 1
+                except discord.HTTPException as exc:
+                    log.warning("Failed to delete webhook %s: %s", wh.id, exc)
+    except discord.Forbidden:
+        log.info("No Manage Webhooks permission; skipping webhook cleanup.")
+    except discord.HTTPException as exc:
+        log.warning("Failed to enumerate webhooks: %s", exc)
+
+    # 3/4. Purge messages newer than 14 days across all text channels & threads.
     cutoff = utcnow() - BULK_DELETE_MAX_AGE
 
     def is_target(message: discord.Message) -> bool:
-        return message.author.id == user.id
+        # Match the user's own messages OR messages posted by their webhooks.
+        if message.author.id == user.id:
+            return True
+        return message.webhook_id is not None and message.webhook_id in target_webhook_ids
 
     total_deleted = 0
     skipped_channels = 0
@@ -258,6 +282,8 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
         f"🔨 Banned **{user}** (`{user.id}`) and deleted **{total_deleted}** "
         f"message(s) from the last 14 days."
     )
+    if deleted_webhooks:
+        summary += f"\n🧹 Removed **{deleted_webhooks}** webhook(s) created by this user."
     if skipped_channels:
         summary += f"\n⚠️ Skipped {skipped_channels} channel(s) due to missing permissions."
     await interaction.followup.send(summary)
@@ -269,6 +295,7 @@ async def bulk_purge_user(interaction: discord.Interaction, user: discord.User) 
         timestamp=utcnow(),
     )
     embed.add_field(name="Messages deleted", value=str(total_deleted))
+    embed.add_field(name="Webhooks removed", value=str(deleted_webhooks))
     embed.add_field(name="Channels skipped", value=str(skipped_channels))
     embed.set_footer(text=f"Action by {interaction.user}")
     await send_mod_log(guild, embed)

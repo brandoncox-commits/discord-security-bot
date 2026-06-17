@@ -12,7 +12,7 @@ config and works out of the box.
 
 | Command | What it does |
 |---|---|
-| `/bulk-purge-user <user>` | Bans the user, then deletes their messages from the last 14 days across all channels & threads. |
+| `/bulk-purge-user <user>` | Bans the user, deletes their messages from the last 14 days across all channels & threads, and removes any webhooks they created plus those webhooks' messages. |
 | `/audit-permissions` | Audits every role, `@everyone`, and all integrations/apps for dangerous permissions. Color-coded embed. |
 | `/purge-webhooks` | Deletes every webhook in the server (closes spam backdoors). Logs names to `#mod-logs`. |
 | `/panic <lock\|unlock>` | Freezes/unfreezes all text channels for `@everyone` during a raid. |
