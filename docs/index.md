@@ -1,10 +1,10 @@
 ---
-title: Discord Security & Moderation Bot
+title: Bams Modmin Tools
 ---
 
-# Discord Security & Moderation Bot
+# Bams Modmin Tools
 
-Legal documents for the Discord Security & Moderation Bot.
+Legal documents for Bams Modmin Tools, a Discord moderation & security bot.
 
 - [Terms of Service](./terms-of-service)
 - [Privacy Policy](./privacy-policy)

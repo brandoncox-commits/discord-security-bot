@@ -2,14 +2,14 @@
 title: Privacy Policy
 ---
 
-# Privacy Policy — Discord Security & Moderation Bot
+# Privacy Policy — Bams Modmin Tools
 
 **Effective date:** 17 June 2026
 **Contact:** brandon.cox@hotmail.co.uk
 
-This Privacy Policy explains what data the Discord Security & Moderation Bot
-("the Bot", "we", "us") accesses and stores when it is added to a Discord
-server ("guild"). By adding the Bot to a server you agree to this policy.
+This Privacy Policy explains what data Bams Modmin Tools ("the Bot", "we", "us")
+accesses and stores when it is added to a Discord server ("guild"). By adding
+the Bot to a server you agree to this policy.
 
 ## 1. Who controls the Bot
 

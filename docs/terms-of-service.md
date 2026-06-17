@@ -2,15 +2,14 @@
 title: Terms of Service
 ---
 
-# Terms of Service — Discord Security & Moderation Bot
+# Terms of Service — Bams Modmin Tools
 
 **Effective date:** 17 June 2026
 **Contact:** brandon.cox@hotmail.co.uk
 
-These Terms of Service ("Terms") govern your use of the Discord Security &
-Moderation Bot ("the Bot"). By adding the Bot to a Discord server ("guild") or
-using its commands, you agree to these Terms. If you do not agree, do not add or
-use the Bot.
+These Terms of Service ("Terms") govern your use of Bams Modmin Tools ("the
+Bot"). By adding the Bot to a Discord server ("guild") or using its commands,
+you agree to these Terms. If you do not agree, do not add or use the Bot.
 
 ## 1. Description of service
 
