@@ -1,0 +1,10 @@
+.env
+panic_state.json
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local dev environment / infrastructure context — not for the public repo
+CLAUDE.md
+.claude/
