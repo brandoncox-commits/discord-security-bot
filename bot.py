@@ -25,7 +25,8 @@ Admin-only (require the Administrator permission, hidden from regular members):
 Open to all members:
 /rank [user]                 Show a member's level, XP, and server rank.
 /leaderboard                 Show the top 10 members by XP in this server.
-/twitch-link                 Link your Twitch account to earn XP from Twitch chat.
+/twitch-link                 Link your Twitch account to earn XP from Twitch chat
+                             (XP is only awarded while the stream is live).
 /twitch-unlink               Unlink your Twitch account.
 
 Setup
@@ -39,6 +40,15 @@ Server Members Intent (enable in the Developer Portal).
 
 Twitch integration is OPTIONAL — the bot runs Discord-only if the TWITCH_*
 env vars are absent or twitchio is not installed.
+
+Twitch XP (Phase 3)
+-------------------
+Twitch chat messages earn Discord XP ONLY while the linked stream is live.
+Live status is determined by polling the Helix Streams API every 60 seconds
+(GET /helix/streams?user_id=...) using the existing app access token.
+The safe default is OFFLINE: if stream status has not yet been polled or the
+broadcaster ID is unknown, no XP is awarded. !link and !approve-xp work
+regardless of whether the stream is live.
 """
 
 from __future__ import annotations
@@ -738,18 +748,55 @@ async def _get_app_access_token() -> Optional[str]:
 
 
 # --------------------------------------------------------------------------- #
-# Twitch — live check seam (Phase 3 will wire this to EventSub)
+# Twitch — live check (Phase 3: poll-based, safe-default-offline)
 # --------------------------------------------------------------------------- #
 
 
 async def _channel_is_live(channel_name: str) -> bool:
     """Return True if the Twitch channel is currently live.
 
-    # TODO Phase 3: replace with real check gated on EventSub stream.online/offline events.
-    Currently always returns True so Twitch chat XP is awarded regardless of
-    stream status. Wire in the real state here without touching any other logic.
+    Looks up the broadcaster_id for `channel_name` from guild_twitch_config,
+    then checks whether that ID is in the TwitchBot's live_broadcasters set
+    (populated every 60 s by _poll_stream_status).
+
+    Safe default: returns False if the twitch client is not ready, the
+    broadcaster ID is unknown, or no poll has completed yet.  This means
+    chatters earn ZERO XP unless we have positively confirmed the stream is
+    live — no false positives on startup or transient API errors.
+
+    Note: !link and !approve-xp are NOT gated by this function; only
+    _handle_xp calls it.
     """
-    return True
+    if twitch_client is None:
+        return False
+
+    tc = twitch_client  # type: ignore[assignment]
+    live: set[int] = getattr(tc, "live_broadcasters", set())
+
+    db = bot.db
+    if db is None:
+        return False
+
+    # Find any guild_twitch_config row whose twitch_channel matches channel_name.
+    # (Multiple guilds can share the same channel, but broadcaster_id is the same.)
+    channel_lower = channel_name.lower()
+    try:
+        async with db.execute(
+            "SELECT twitch_broadcaster_id FROM guild_twitch_config"
+            " WHERE twitch_channel = ? AND twitch_broadcaster_id IS NOT NULL"
+            " LIMIT 1",
+            (channel_lower,),
+        ) as cur:
+            row = await cur.fetchone()
+    except Exception as exc:
+        log.warning("_channel_is_live DB lookup error for '%s': %s", channel_name, exc)
+        return False
+
+    if row is None:
+        return False  # channel not configured or broadcaster ID unknown
+
+    broadcaster_id = int(row["twitch_broadcaster_id"])
+    return broadcaster_id in live
 
 
 # --------------------------------------------------------------------------- #
@@ -771,12 +818,124 @@ if twitch_enabled:
                 initial_channels=initial_channels,
                 nick=TWITCH_BOT_USERNAME,
             )
+            # Phase 3: set of broadcaster user IDs currently live.
+            # Populated (and replaced atomically) by _poll_stream_status every 60s.
+            # Starts empty so the safe default is OFFLINE until the first poll completes.
+            self.live_broadcasters: set[int] = set()
 
         async def event_ready(self) -> None:
             log.info("Twitch bot ready | nick: %s", self.nick)
+            # Phase 3: start the stream-status poll loop as a background task.
+            asyncio.create_task(self._poll_stream_status())
 
         async def event_error(self, error: Exception, data: str = "") -> None:
             log.error("Twitch client error: %s | data: %s", error, data)
+
+        async def _poll_stream_status(self) -> None:
+            """Background task: poll Helix /streams every 60s to update live_broadcasters.
+
+            Runs one poll immediately at startup (before the first sleep) so live status
+            is fresh quickly. On any API or network error the previous live_broadcasters
+            set is kept intact — we never flap to empty on a transient failure.
+            Broadcaster transitions (live→offline, offline→live) are logged at INFO.
+            The loop catches all exceptions and continues so it can never kill itself.
+            """
+            first_run = True
+            while True:
+                if not first_run:
+                    await asyncio.sleep(60)
+                first_run = False
+
+                try:
+                    db = bot.db
+                    if db is None:
+                        continue  # DB not ready yet; try again next tick
+
+                    # Collect all distinct broadcaster IDs currently configured.
+                    try:
+                        async with db.execute(
+                            "SELECT DISTINCT twitch_broadcaster_id FROM guild_twitch_config"
+                            " WHERE twitch_broadcaster_id IS NOT NULL"
+                        ) as cur:
+                            id_rows = await cur.fetchall()
+                    except Exception as exc:
+                        log.warning("Twitch poll: DB query error: %s", exc)
+                        continue
+
+                    if not id_rows:
+                        # No channels configured — clear the set and wait.
+                        self.live_broadcasters = set()
+                        continue
+
+                    broadcaster_ids = [int(r["twitch_broadcaster_id"]) for r in id_rows]
+
+                    # Fetch an app access token (cached, auto-refreshed).
+                    if not _AIOHTTP_AVAILABLE:
+                        continue
+                    token = await _get_app_access_token()
+                    if not token:
+                        log.warning("Twitch poll: could not get app access token; skipping tick")
+                        continue
+
+                    # Query Helix /streams for all broadcaster IDs (up to 100 per request).
+                    # Helix only returns currently-live streams in the response.
+                    new_live: set[int] = set()
+                    try:
+                        # Batch into groups of 100 (Discord channels will be far fewer in practice).
+                        for batch_start in range(0, len(broadcaster_ids), 100):
+                            batch = broadcaster_ids[batch_start:batch_start + 100]
+                            params = [("user_id", str(bid)) for bid in batch]
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(
+                                    "https://api.twitch.tv/helix/streams",
+                                    params=params,
+                                    headers={
+                                        "Client-ID": TWITCH_CLIENT_ID,
+                                        "Authorization": f"Bearer {token}",
+                                    },
+                                ) as resp:
+                                    if resp.status != 200:
+                                        log.warning(
+                                            "Twitch poll: Helix /streams returned HTTP %s; "
+                                            "keeping previous live set",
+                                            resp.status,
+                                        )
+                                        # On non-200, bail out of the whole tick without
+                                        # replacing live_broadcasters (keep prior state).
+                                        new_live = None  # type: ignore[assignment]
+                                        break
+                                    data = await resp.json()
+                                    for stream in data.get("data", []):
+                                        if stream.get("type") == "live":
+                                            try:
+                                                new_live.add(int(stream["user_id"]))
+                                            except (KeyError, ValueError):
+                                                pass
+                    except Exception as exc:
+                        log.warning(
+                            "Twitch poll: API request error: %s; keeping previous live set", exc
+                        )
+                        continue  # keep previous self.live_broadcasters on error
+
+                    if new_live is None:
+                        # Non-200 from Helix — keep previous state (already logged above).
+                        continue
+
+                    # Log transitions before replacing the set.
+                    prev = self.live_broadcasters
+                    went_live = new_live - prev
+                    went_offline = prev - new_live
+                    for bid in went_live:
+                        log.info("Twitch stream went LIVE: broadcaster_id=%s", bid)
+                    for bid in went_offline:
+                        log.info("Twitch stream went OFFLINE: broadcaster_id=%s", bid)
+
+                    # Atomic replacement.
+                    self.live_broadcasters = new_live
+
+                except Exception as exc:
+                    # Catch-all: log and continue so the loop never dies.
+                    log.warning("Twitch poll: unexpected error in poll tick: %s", exc, exc_info=True)
 
         async def event_message(self, message: twitchio.Message) -> None:
             """Handle incoming Twitch chat messages."""
@@ -1207,7 +1366,8 @@ COMMAND_HELP = [
     (
         "/twitch-link",
         "[All members] Generate a one-time code to link your Twitch account. "
-        "Once linked, chatting in the server's Twitch channel also earns you Discord XP.",
+        "Once linked, chatting in the server's Twitch channel earns you Discord XP "
+        "while the stream is live.",
     ),
     (
         "/twitch-unlink",
@@ -2375,7 +2535,7 @@ async def twitch_setup(interaction: discord.Interaction, channel: str) -> None:
 
 @bot.tree.command(
     name="twitch-link",
-    description="Link your Twitch account to earn XP from Twitch chat.",
+    description="Link your Twitch account to earn XP from Twitch chat (live streams only).",
 )
 async def twitch_link(interaction: discord.Interaction) -> None:
     guild = interaction.guild
