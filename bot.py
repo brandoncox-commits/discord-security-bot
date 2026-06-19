@@ -548,6 +548,10 @@ async def _start_twitch_client() -> None:
 
     Called once from on_ready so we know setup_hook (and thus the DB) is ready.
     Safe to call only when twitch_enabled is True.
+
+    Before constructing TwitchBot, exchanges the stored refresh token for a
+    fresh user access token so every startup self-heals into a valid ~4 h token
+    even when the previously-stored access token has expired.
     """
     global twitch_client
     assert bot.db is not None
@@ -561,8 +565,21 @@ async def _start_twitch_client() -> None:
     if not initial_channels:
         log.info("Twitch: no channels configured yet; joining when /twitch-setup is run")
 
+    # Refresh the user access token before connecting so we never start with a
+    # stale token.  On failure we log and bail — Discord keeps running.
+    refreshed = await _refresh_twitch_user_token()
+    if not refreshed:
+        log.error(
+            "Twitch client: token refresh failed at startup — Twitch integration "
+            "disabled for this run. Re-run twitch_auth.py to mint new tokens, "
+            "update .env, and restart the service."
+        )
+        return
+
+    fresh_token = _twitch_user_token["access_token"]
+
     try:
-        tc = TwitchBot(initial_channels=initial_channels)  # type: ignore[name-defined]
+        tc = TwitchBot(token=fresh_token, initial_channels=initial_channels)  # type: ignore[name-defined]
         twitch_client = tc
         await tc.start()
     except Exception as exc:
@@ -918,6 +935,130 @@ async def _announce_level_up(
 
 
 # --------------------------------------------------------------------------- #
+# Twitch — user-token refresh (keeps bot-account token alive across restarts)
+# --------------------------------------------------------------------------- #
+
+# Module-level mutable holder so _start_twitch_client can update the token
+# after a refresh without requiring a global declaration everywhere.
+_twitch_user_token: dict[str, str] = {
+    "access_token": TWITCH_BOT_ACCESS_TOKEN,
+    "refresh_token": TWITCH_BOT_REFRESH_TOKEN,
+}
+
+# Absolute path to the .env file the service loads (same directory as bot.py).
+_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+async def _refresh_twitch_user_token() -> bool:
+    """Exchange the stored refresh token for a fresh Twitch user access token.
+
+    Posts to https://id.twitch.tv/oauth2/token with grant_type=refresh_token,
+    updates _twitch_user_token in-memory, and persists both tokens back to the
+    .env file so the NEXT service restart also has a valid token.
+
+    Returns True on success, False on any error (caller handles graceful skip).
+    """
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and _AIOHTTP_AVAILABLE):
+        log.warning("Twitch token refresh: missing client_id/secret or aiohttp unavailable")
+        return False
+
+    refresh_token = _twitch_user_token["refresh_token"]
+    if not refresh_token:
+        log.error(
+            "Twitch token refresh: no refresh token available. "
+            "Re-mint tokens by running twitch_auth.py and updating .env."
+        )
+        return False
+
+    log.info("Twitch token refresh: exchanging refresh token for a fresh user access token")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://id.twitch.tv/oauth2/token",
+                params={
+                    "client_id": TWITCH_CLIENT_ID,
+                    "client_secret": TWITCH_CLIENT_SECRET,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(
+                        "Twitch token refresh: HTTP %s from Twitch — refresh token may be "
+                        "revoked. Re-run twitch_auth.py to mint new tokens. Response: %s",
+                        resp.status, body[:200],
+                    )
+                    return False
+                data = await resp.json()
+    except Exception as exc:
+        log.error("Twitch token refresh: network error: %s", exc)
+        return False
+
+    new_access = data.get("access_token", "")
+    new_refresh = data.get("refresh_token", "") or refresh_token  # Twitch may not rotate
+    if not new_access:
+        log.error("Twitch token refresh: response contained no access_token: %s", data)
+        return False
+
+    _twitch_user_token["access_token"] = new_access
+    _twitch_user_token["refresh_token"] = new_refresh
+    log.info("Twitch token refresh: got fresh access token (refresh_token %s)",
+             "rotated" if new_refresh != refresh_token else "unchanged")
+
+    _persist_twitch_tokens(new_access, new_refresh)
+    return True
+
+
+def _persist_twitch_tokens(access_token: str, refresh_token: str) -> None:
+    """Rewrite TWITCH_BOT_ACCESS_TOKEN and TWITCH_BOT_REFRESH_TOKEN in the .env file.
+
+    Only those two lines are changed; all other lines are preserved exactly.
+    If the .env file does not exist or cannot be written, logs a warning but
+    does NOT raise — the in-memory token is already valid for this run.
+    """
+    if not os.path.isfile(_ENV_FILE):
+        log.warning(
+            "Twitch token persist: .env not found at %s — tokens updated in memory only",
+            _ENV_FILE,
+        )
+        return
+
+    try:
+        with open(_ENV_FILE, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+
+        new_lines: list[str] = []
+        found_access = False
+        found_refresh = False
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("TWITCH_BOT_ACCESS_TOKEN="):
+                new_lines.append(f"TWITCH_BOT_ACCESS_TOKEN={access_token}\n")
+                found_access = True
+            elif stripped.startswith("TWITCH_BOT_REFRESH_TOKEN="):
+                new_lines.append(f"TWITCH_BOT_REFRESH_TOKEN={refresh_token}\n")
+                found_refresh = True
+            else:
+                new_lines.append(line)
+
+        # Append any keys that were missing entirely (unlikely, but safe).
+        if not found_access:
+            new_lines.append(f"TWITCH_BOT_ACCESS_TOKEN={access_token}\n")
+            log.warning("Twitch token persist: TWITCH_BOT_ACCESS_TOKEN was not in .env; appended")
+        if not found_refresh:
+            new_lines.append(f"TWITCH_BOT_REFRESH_TOKEN={refresh_token}\n")
+            log.warning("Twitch token persist: TWITCH_BOT_REFRESH_TOKEN was not in .env; appended")
+
+        with open(_ENV_FILE, "w", encoding="utf-8") as fh:
+            fh.writelines(new_lines)
+
+        log.info("Twitch token persist: .env updated at %s", _ENV_FILE)
+    except OSError as exc:
+        log.warning("Twitch token persist: could not write .env: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
 # Twitch — app-token cache (client_credentials for Helix API calls)
 # --------------------------------------------------------------------------- #
 
@@ -1040,10 +1181,13 @@ if twitch_enabled:
     class TwitchBot(twitch_commands.Bot):
         """twitchio 2.x Bot that awards Discord XP for Twitch chat messages."""
 
-        def __init__(self, initial_channels: list[str]) -> None:
-            # twitchio 2.x: token must be bare (no oauth: prefix for ext.commands.Bot)
+        def __init__(self, token: str, initial_channels: list[str]) -> None:
+            # twitchio 2.x: token must be bare (no oauth: prefix for ext.commands.Bot).
+            # `token` is passed in from _start_twitch_client after being refreshed;
+            # never hardcoded from the module-level TWITCH_BOT_ACCESS_TOKEN constant
+            # which may be stale after the ~4 h Twitch expiry.
             super().__init__(
-                token=TWITCH_BOT_ACCESS_TOKEN,
+                token=token,
                 client_secret=TWITCH_CLIENT_SECRET,
                 prefix="!",
                 initial_channels=initial_channels,
