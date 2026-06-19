@@ -17,10 +17,13 @@ Admin-only (require the Administrator permission, hidden from regular members):
 /wipe-invites                Delete all active invite links.
 /trace-app <app>             Find the user(s) behind an app/bot.
 /xp-config                   Configure the per-guild XP/leveling system.
+/twitch-setup <channel>      [Admin] Link a Twitch channel so chat earns Discord XP.
 
 Open to all members:
 /rank [user]                 Show a member's level, XP, and server rank.
 /leaderboard                 Show the top 10 members by XP in this server.
+/twitch-link                 Link your Twitch account to earn XP from Twitch chat.
+/twitch-unlink               Unlink your Twitch account.
 
 Setup
 -----
@@ -30,14 +33,20 @@ Setup
 
 Install scope: `bot applications.commands`. Required privileged intent:
 Server Members Intent (enable in the Developer Portal).
+
+Twitch integration is OPTIONAL — the bot runs Discord-only if the TWITCH_*
+env vars are absent or twitchio is not installed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import random
+import secrets
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -46,6 +55,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Graceful degradation: twitchio is optional.
+try:
+    import twitchio
+    from twitchio.ext import commands as twitch_commands
+    _TWITCHIO_AVAILABLE = True
+except ImportError:
+    _TWITCHIO_AVAILABLE = False
+
+# aiohttp is needed for the Helix app-token helper (bundled with twitchio / discord.py)
+try:
+    import aiohttp
+    _AIOHTTP_AVAILABLE = True
+except ImportError:
+    _AIOHTTP_AVAILABLE = False
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -60,6 +84,22 @@ MOD_LOG_CHANNEL_ID = int(os.getenv("MOD_LOG_CHANNEL_ID", "0") or "0")
 # Optional: a guild ID to sync commands to instantly (handy for testing). Leave
 # blank for global sync (available everywhere, but can take up to ~1h the first time).
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0") or "0")
+
+# --- Twitch config (all optional; bot runs Discord-only if any are missing) --- #
+TWITCH_CLIENT_ID = os.getenv("TWITCH_CLIENT_ID", "")
+TWITCH_CLIENT_SECRET = os.getenv("TWITCH_CLIENT_SECRET", "")
+TWITCH_BOT_USERNAME = os.getenv("TWITCH_BOT_USERNAME", "")
+TWITCH_BOT_ACCESS_TOKEN = os.getenv("TWITCH_BOT_ACCESS_TOKEN", "")
+TWITCH_BOT_REFRESH_TOKEN = os.getenv("TWITCH_BOT_REFRESH_TOKEN", "")
+
+_TWITCH_ENV_VARS = (
+    TWITCH_CLIENT_ID,
+    TWITCH_CLIENT_SECRET,
+    TWITCH_BOT_USERNAME,
+    TWITCH_BOT_ACCESS_TOKEN,
+    TWITCH_BOT_REFRESH_TOKEN,
+)
+twitch_enabled: bool = _TWITCHIO_AVAILABLE and all(_TWITCH_ENV_VARS)
 
 # Discord only allows *bulk* deletion of messages younger than 14 days.
 BULK_DELETE_MAX_AGE = timedelta(days=14)
@@ -241,8 +281,6 @@ def level_for_xp(total_xp: int) -> int:
     """
     level = 0
     while True:
-        # XP needed to advance from current level to the next
-        next_step = 5 * (level ** 2) + 50 * level + 100
         if total_xp < xp_for_level(level + 1):
             return level
         level += 1
@@ -280,6 +318,8 @@ class ModminBot(commands.Bot):
         self.db = await aiosqlite.connect(XP_DB_FILE)
         self.db.row_factory = aiosqlite.Row
         await self.db.execute("PRAGMA journal_mode=WAL")
+
+        # --- Phase 1 tables ---
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS user_xp (
                 guild_id    INTEGER NOT NULL,
@@ -300,6 +340,39 @@ class ModminBot(commands.Bot):
                 level_up_channel_id INTEGER
             )
         """)
+
+        # --- Phase 2 tables (Twitch integration) ---
+        # Maps a Twitch account to a Discord user globally (one row per linked pair).
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS linked_accounts (
+                twitch_user_id  INTEGER PRIMARY KEY,
+                twitch_login    TEXT,
+                discord_user_id INTEGER NOT NULL,
+                linked_at       TEXT
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_linked_accounts_discord_user_id
+            ON linked_accounts (discord_user_id)
+        """)
+        # Short-lived codes used by /twitch-link → !link <CODE> flow.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_link_codes (
+                code            TEXT PRIMARY KEY,
+                discord_user_id INTEGER NOT NULL,
+                created_at      TEXT,
+                expires_at      TEXT
+            )
+        """)
+        # Maps a Discord guild to the Twitch channel whose chat earns XP.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS guild_twitch_config (
+                guild_id              INTEGER PRIMARY KEY,
+                twitch_channel        TEXT,
+                twitch_broadcaster_id INTEGER
+            )
+        """)
+
         await self.db.commit()
         log.info("XP database ready at %s", XP_DB_FILE)
 
@@ -324,9 +397,41 @@ class ModminBot(commands.Bot):
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="/help")
         )
+        # Start the Twitch client once the Discord bot (and DB) are ready.
+        # This avoids any ordering issue between setup_hook and asyncio.gather.
+        if twitch_enabled and not getattr(self, "_twitch_started", False):
+            self._twitch_started = True
+            asyncio.create_task(_start_twitch_client())
 
 
 bot = ModminBot()
+
+
+async def _start_twitch_client() -> None:
+    """Build and start the TwitchBot, loading initial channels from the DB.
+
+    Called once from on_ready so we know setup_hook (and thus the DB) is ready.
+    Safe to call only when twitch_enabled is True.
+    """
+    global twitch_client
+    assert bot.db is not None
+
+    async with bot.db.execute(
+        "SELECT twitch_channel FROM guild_twitch_config WHERE twitch_channel IS NOT NULL"
+    ) as cur:
+        channel_rows = await cur.fetchall()
+    initial_channels = [r["twitch_channel"] for r in channel_rows]
+
+    if not initial_channels:
+        log.info("Twitch: no channels configured yet; joining when /twitch-setup is run")
+
+    try:
+        tc = TwitchBot(initial_channels=initial_channels)  # type: ignore[name-defined]
+        twitch_client = tc
+        await tc.start()
+    except Exception as exc:
+        log.error("Twitch client crashed: %s", exc, exc_info=True)
+        # Do NOT re-raise — Discord bot must keep running.
 
 
 # --------------------------------------------------------------------------- #
@@ -426,13 +531,69 @@ async def _get_user_xp_row(
 
 
 # --------------------------------------------------------------------------- #
-# on_message — award XP
+# XP helpers — shared award core (used by both Discord and Twitch paths)
+# --------------------------------------------------------------------------- #
+
+
+async def _award_xp(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    user_id: int,
+) -> Optional[tuple[int, int, int, int]]:
+    """Try to award XP to a user in a guild.
+
+    Returns (gained, new_xp, old_level, new_level) on success, or None if the
+    user is on cooldown or XP is disabled for the guild.
+
+    This is the SHARED core used by both the Discord on_message handler and the
+    Twitch chat handler so the logic (cooldown, XP range, level math) stays in
+    one place.
+    """
+    config = await _get_guild_xp_config(db, guild_id)
+    if not config["enabled"]:
+        return None
+
+    cooldown_secs: int = config["cooldown_secs"]
+    xp_min: int = config["xp_min"]
+    xp_max: int = config["xp_max"]
+
+    row = await _get_user_xp_row(db, guild_id, user_id)
+
+    # Cooldown check — compare UTC timestamps stored as ISO-8601 strings.
+    if row["last_xp_at"] is not None:
+        last = datetime.fromisoformat(row["last_xp_at"])
+        if (utcnow() - last).total_seconds() < cooldown_secs:
+            return None  # still on cooldown
+
+    gained = random.randint(xp_min, xp_max)
+    new_xp = row["xp"] + gained
+    old_level = row["level"]
+    new_level = level_for_xp(new_xp)
+    now_iso = utcnow().isoformat()
+
+    await db.execute(
+        """
+        INSERT INTO user_xp (guild_id, user_id, xp, level, last_xp_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+            xp         = excluded.xp,
+            level      = excluded.level,
+            last_xp_at = excluded.last_xp_at
+        """,
+        (guild_id, user_id, new_xp, new_level, now_iso),
+    )
+    await db.commit()
+    return (gained, new_xp, old_level, new_level)
+
+
+# --------------------------------------------------------------------------- #
+# on_message — award XP (Discord path)
 # --------------------------------------------------------------------------- #
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
-    """Award XP for messages, respecting per-guild config and per-user cooldown."""
+    """Award XP for Discord messages, respecting per-guild config and per-user cooldown."""
     # Ignore bots (including ourselves) and DMs.
     if message.author.bot or message.guild is None:
         return
@@ -445,57 +606,41 @@ async def on_message(message: discord.Message) -> None:
     user_id = message.author.id
 
     try:
-        config = await _get_guild_xp_config(db, guild_id)
-        if not config["enabled"]:
-            return
+        result = await _award_xp(db, guild_id, user_id)
+        if result is None:
+            return  # disabled or on cooldown
 
-        xp_min: int = config["xp_min"]
-        xp_max: int = config["xp_max"]
-        cooldown_secs: int = config["cooldown_secs"]
-        level_up_channel_id: Optional[int] = config["level_up_channel_id"]
-
-        # Cooldown check — compare UTC timestamps stored as ISO-8601 strings.
-        row = await _get_user_xp_row(db, guild_id, user_id)
-        if row["last_xp_at"] is not None:
-            last = datetime.fromisoformat(row["last_xp_at"])
-            if (utcnow() - last).total_seconds() < cooldown_secs:
-                return  # still on cooldown
-
-        # Award XP.
-        gained = random.randint(xp_min, xp_max)
-        new_xp = row["xp"] + gained
-        old_level = row["level"]
-        new_level = level_for_xp(new_xp)
-        now_iso = utcnow().isoformat()
-
-        await db.execute(
-            """
-            INSERT INTO user_xp (guild_id, user_id, xp, level, last_xp_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                xp         = excluded.xp,
-                level      = excluded.level,
-                last_xp_at = excluded.last_xp_at
-            """,
-            (guild_id, user_id, new_xp, new_level, now_iso),
-        )
-        await db.commit()
+        _gained, _new_xp, old_level, new_level = result
 
         # Level-up announcement (public, best-effort).
         if new_level > old_level:
-            await _announce_level_up(message, new_level, level_up_channel_id)
+            config = await _get_guild_xp_config(db, guild_id)
+            await _announce_level_up(
+                guild=message.guild,
+                member=message.author,
+                new_level=new_level,
+                level_up_channel_id=config["level_up_channel_id"],
+                fallback_channel=message.channel if isinstance(
+                    message.channel, discord.TextChannel
+                ) else None,
+            )
 
     except Exception as exc:
         log.warning("XP award failed for user %s in guild %s: %s", user_id, guild_id, exc)
 
 
 async def _announce_level_up(
-    message: discord.Message, new_level: int, level_up_channel_id: Optional[int]
+    guild: discord.Guild,
+    member: discord.abc.User,
+    new_level: int,
+    level_up_channel_id: Optional[int],
+    fallback_channel: Optional[discord.TextChannel] = None,
 ) -> None:
-    """Post a public level-up message. Best-effort; swallows all HTTP errors."""
-    guild = message.guild
-    member = message.author
+    """Post a public level-up message. Best-effort; swallows all HTTP errors.
 
+    Works for both Discord messages (pass fallback_channel) and Twitch-triggered
+    level-ups (fallback_channel=None, falls back to first writable channel or skips).
+    """
     # Resolve the destination channel.
     dest: Optional[discord.TextChannel] = None
     if level_up_channel_id:
@@ -503,9 +648,7 @@ async def _announce_level_up(
         if isinstance(ch, discord.TextChannel):
             dest = ch
     if dest is None:
-        # Fall back to the channel where the message was sent.
-        if isinstance(message.channel, discord.TextChannel):
-            dest = message.channel
+        dest = fallback_channel
 
     if dest is None:
         return
@@ -520,7 +663,7 @@ async def _announce_level_up(
             color=discord.Color.gold(),
             timestamp=utcnow(),
         )
-        if member.display_avatar:
+        if hasattr(member, "display_avatar") and member.display_avatar:
             embed.set_thumbnail(url=member.display_avatar.url)
         embed.set_footer(text=f"{guild.name} XP System")
         await dest.send(embed=embed)
@@ -529,38 +672,315 @@ async def _announce_level_up(
 
 
 # --------------------------------------------------------------------------- #
+# Twitch — app-token cache (client_credentials for Helix API calls)
+# --------------------------------------------------------------------------- #
+
+_app_token_cache: dict[str, object] = {"token": None, "expires_at": 0.0}
+
+
+async def _get_app_access_token() -> Optional[str]:
+    """Fetch (and cache) a Twitch app access token via client_credentials.
+
+    Returns None if Twitch env vars are absent or aiohttp is unavailable.
+    Refreshes automatically when within 60 seconds of expiry.
+    """
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and _AIOHTTP_AVAILABLE):
+        return None
+
+    now = time.monotonic()
+    if _app_token_cache["token"] and now < float(_app_token_cache["expires_at"]) - 60:
+        return str(_app_token_cache["token"])
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://id.twitch.tv/oauth2/token",
+                params={
+                    "client_id": TWITCH_CLIENT_ID,
+                    "client_secret": TWITCH_CLIENT_SECRET,
+                    "grant_type": "client_credentials",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("Twitch app token request failed: HTTP %s", resp.status)
+                    return None
+                data = await resp.json()
+    except Exception as exc:
+        log.warning("Twitch app token fetch error: %s", exc)
+        return None
+
+    token = data.get("access_token")
+    expires_in = data.get("expires_in", 3600)
+    _app_token_cache["token"] = token
+    _app_token_cache["expires_at"] = now + expires_in
+    return token
+
+
+# --------------------------------------------------------------------------- #
+# Twitch — live check seam (Phase 3 will wire this to EventSub)
+# --------------------------------------------------------------------------- #
+
+
+async def _channel_is_live(channel_name: str) -> bool:
+    """Return True if the Twitch channel is currently live.
+
+    # TODO Phase 3: replace with real check gated on EventSub stream.online/offline events.
+    Currently always returns True so Twitch chat XP is awarded regardless of
+    stream status. Wire in the real state here without touching any other logic.
+    """
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Twitch — twitchio 2.x client
+# --------------------------------------------------------------------------- #
+
+twitch_client: Optional[object] = None  # set below if twitch_enabled
+
+if twitch_enabled:
+    class TwitchBot(twitch_commands.Bot):
+        """twitchio 2.x Bot that awards Discord XP for Twitch chat messages."""
+
+        def __init__(self, initial_channels: list[str]) -> None:
+            # twitchio 2.x: token must be bare (no oauth: prefix for ext.commands.Bot)
+            super().__init__(
+                token=TWITCH_BOT_ACCESS_TOKEN,
+                client_secret=TWITCH_CLIENT_SECRET,
+                prefix="!",
+                initial_channels=initial_channels,
+                nick=TWITCH_BOT_USERNAME,
+            )
+
+        async def event_ready(self) -> None:
+            log.info("Twitch bot ready | nick: %s", self.nick)
+
+        async def event_error(self, error: Exception, data: str = "") -> None:
+            log.error("Twitch client error: %s | data: %s", error, data)
+
+        async def event_message(self, message: twitchio.Message) -> None:
+            """Handle incoming Twitch chat messages."""
+            # Ignore messages from the bot itself.
+            if message.echo:
+                return
+
+            content = message.content.strip()
+            channel_name = message.channel.name.lower()
+
+            # ---- !link <CODE> handler ----------------------------------------
+            parts = content.split()
+            if len(parts) == 2 and parts[0].lower() == "!link":
+                await self._handle_link(message, parts[1].upper(), channel_name)
+                return
+
+            # ---- Normal chat → XP award -------------------------------------
+            await self._handle_xp(message, channel_name)
+
+        async def _handle_link(
+            self,
+            message: twitchio.Message,
+            code: str,
+            channel_name: str,
+        ) -> None:
+            """Process a !link <CODE> command from Twitch chat."""
+            db = bot.db
+            if db is None:
+                return
+
+            twitch_user = message.author
+            twitch_user_id = int(twitch_user.id)
+            twitch_login = twitch_user.name.lower()
+            now = utcnow()
+
+            try:
+                # Look up the code (case-insensitive).
+                async with db.execute(
+                    "SELECT * FROM pending_link_codes WHERE code = ?", (code,)
+                ) as cur:
+                    code_row = await cur.fetchone()
+
+                if code_row is None:
+                    try:
+                        await message.channel.send(
+                            f"@{twitch_user.name} That link code wasn't found. "
+                            "Use /twitch-link in Discord to get a fresh code."
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                # Check expiry.
+                expires_at = datetime.fromisoformat(code_row["expires_at"])
+                if now > expires_at:
+                    await db.execute(
+                        "DELETE FROM pending_link_codes WHERE code = ?", (code,)
+                    )
+                    await db.commit()
+                    try:
+                        await message.channel.send(
+                            f"@{twitch_user.name} That code has expired. "
+                            "Use /twitch-link in Discord to get a new one."
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                discord_user_id = code_row["discord_user_id"]
+
+                # Upsert the linked_accounts row.
+                await db.execute(
+                    """
+                    INSERT INTO linked_accounts
+                        (twitch_user_id, twitch_login, discord_user_id, linked_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(twitch_user_id) DO UPDATE SET
+                        twitch_login    = excluded.twitch_login,
+                        discord_user_id = excluded.discord_user_id,
+                        linked_at       = excluded.linked_at
+                    """,
+                    (twitch_user_id, twitch_login, discord_user_id, now.isoformat()),
+                )
+                # Delete the used code.
+                await db.execute(
+                    "DELETE FROM pending_link_codes WHERE code = ?", (code,)
+                )
+                await db.commit()
+
+                log.info(
+                    "Twitch link: twitch_user_id=%s (%s) → discord_user_id=%s",
+                    twitch_user_id, twitch_login, discord_user_id,
+                )
+
+                # Confirm in Twitch chat (best-effort).
+                try:
+                    await message.channel.send(
+                        f"@{twitch_user.name} Successfully linked! "
+                        "You'll now earn Discord XP from Twitch chat."
+                    )
+                except Exception:
+                    pass
+
+                # Best-effort DM the Discord user.
+                try:
+                    discord_user = await bot.fetch_user(discord_user_id)
+                    if discord_user:
+                        await discord_user.send(
+                            f"Your Twitch account **{twitch_user.name}** has been linked "
+                            "to your Discord account. You'll earn XP in Discord servers "
+                            "that have Twitch integration enabled by chatting on Twitch!"
+                        )
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                log.warning("Twitch !link handler error: %s", exc)
+
+        async def _handle_xp(
+            self, message: twitchio.Message, channel_name: str
+        ) -> None:
+            """Award Discord XP for a normal Twitch chat message."""
+            # Gate on stream being live (Phase 3 seam).
+            if not await _channel_is_live(channel_name):
+                return
+
+            db = bot.db
+            if db is None:
+                return
+
+            twitch_user_id = int(message.author.id)
+
+            try:
+                # Resolve Twitch user → Discord user.
+                async with db.execute(
+                    "SELECT discord_user_id FROM linked_accounts WHERE twitch_user_id = ?",
+                    (twitch_user_id,),
+                ) as cur:
+                    link_row = await cur.fetchone()
+
+                if link_row is None:
+                    return  # chatter has no linked Discord account
+
+                discord_user_id = link_row["discord_user_id"]
+
+                # Find all Discord guilds mapped to this Twitch channel.
+                async with db.execute(
+                    "SELECT guild_id FROM guild_twitch_config WHERE twitch_channel = ?",
+                    (channel_name,),
+                ) as cur:
+                    guild_rows = await cur.fetchall()
+
+                for guild_row in guild_rows:
+                    guild_id = guild_row["guild_id"]
+                    guild = bot.get_guild(guild_id)
+                    if guild is None:
+                        continue  # bot not in this guild (yet)
+
+                    try:
+                        result = await _award_xp(db, guild_id, discord_user_id)
+                        if result is None:
+                            continue  # disabled or on cooldown
+
+                        _gained, _new_xp, old_level, new_level = result
+
+                        if new_level > old_level:
+                            config = await _get_guild_xp_config(db, guild_id)
+                            member = guild.get_member(discord_user_id)
+                            if member is not None:
+                                await _announce_level_up(
+                                    guild=guild,
+                                    member=member,
+                                    new_level=new_level,
+                                    level_up_channel_id=config["level_up_channel_id"],
+                                    fallback_channel=None,
+                                )
+                    except Exception as exc:
+                        log.warning(
+                            "Twitch XP award error for discord_user_id=%s guild=%s: %s",
+                            discord_user_id, guild_id, exc,
+                        )
+
+            except Exception as exc:
+                log.warning("Twitch XP handler error: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
 # /help
 # --------------------------------------------------------------------------- #
 
 COMMAND_HELP = [
-    ("/help", "Show this command list."),
+    ("/help", "[Admin] Show this command list."),
     (
         "/bulk-purge-user <user>",
-        "Ban the user, delete their messages from the last 14 days across all "
+        "[Admin] Ban the user, delete their messages from the last 14 days across all "
         "channels & threads, and remove any webhooks they created (plus those "
         "webhooks' messages).",
     ),
     (
         "/audit-permissions",
-        "Audit every role, @everyone, and all integrations/apps for dangerous "
+        "[Admin] Audit every role, @everyone, and all integrations/apps for dangerous "
         "permissions. Returns a colour-coded embed.",
     ),
-    ("/purge-webhooks", "Delete every webhook in the server to close spam backdoors."),
+    ("/purge-webhooks", "[Admin] Delete every webhook in the server to close spam backdoors."),
     (
         "/panic <lock|unlock>",
-        "lock freezes all text channels for @everyone (skipping already read-only "
+        "[Admin] lock freezes all text channels for @everyone (skipping already read-only "
         "ones); unlock restores them to their exact pre-lock state.",
     ),
-    ("/wipe-invites", "Delete all active invite links so banned users can't rejoin."),
+    ("/wipe-invites", "[Admin] Delete all active invite links so banned users can't rejoin."),
     (
         "/trace-app <app>",
-        "Find the user(s) behind an app/bot — the integration installer and/or "
+        "[Admin] Find the user(s) behind an app/bot — the integration installer and/or "
         "whoever invoked a user-installed app to post — so you can ban them.",
     ),
     (
         "/xp-config",
         "[Admin] Configure the per-guild XP/leveling system: enable/disable, "
         "XP range, cooldown, and level-up announcement channel.",
+    ),
+    (
+        "/twitch-setup <channel>",
+        "[Admin] Link a Twitch channel to this Discord server. Members who link their "
+        "Twitch account via /twitch-link will earn Discord XP by chatting in that "
+        "Twitch channel.",
     ),
     (
         "/rank [user]",
@@ -570,6 +990,15 @@ COMMAND_HELP = [
     (
         "/leaderboard",
         "[All members] Show the top 10 members by XP in this server.",
+    ),
+    (
+        "/twitch-link",
+        "[All members] Generate a one-time code to link your Twitch account. "
+        "Once linked, chatting in the server's Twitch channel also earns you Discord XP.",
+    ),
+    (
+        "/twitch-unlink",
+        "[All members] Remove the link between your Discord and Twitch accounts.",
     ),
 ]
 
@@ -584,14 +1013,14 @@ async def help_command(interaction: discord.Interaction) -> None:
         timestamp=utcnow(),
     )
     embed.description = (
-        "Most commands require the **Administrator** permission.\n"
+        "Commands marked **[Admin]** require the **Administrator** permission.\n"
         "Commands marked **[All members]** are open to everyone."
     )
     for name, desc in COMMAND_HELP:
         embed.add_field(name=name, value=desc, inline=False)
     embed.set_footer(
         text="Admin actions are logged to #mod-logs if that channel exists. "
-        "XP view commands (/rank, /leaderboard) are open to all members."
+        "XP view commands (/rank, /leaderboard) and Twitch linking are open to all members."
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1513,6 +1942,286 @@ async def leaderboard(interaction: discord.Interaction) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Feature 8: Twitch integration — /twitch-setup (admin only)
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="twitch-setup",
+    description="Link a Twitch channel to this server so chat earns Discord XP.",
+)
+@app_commands.describe(
+    channel="The Twitch channel login name (e.g. 'shroud', NOT the URL)."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def twitch_setup(interaction: discord.Interaction, channel: str) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    channel_login = channel.strip().lstrip("@").lower()
+
+    # Validate via Helix API if Twitch credentials are configured.
+    broadcaster_id: Optional[int] = None
+    if TWITCH_CLIENT_ID and _AIOHTTP_AVAILABLE:
+        app_token = await _get_app_access_token()
+        if app_token:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://api.twitch.tv/helix/users",
+                        params={"login": channel_login},
+                        headers={
+                            "Client-ID": TWITCH_CLIENT_ID,
+                            "Authorization": f"Bearer {app_token}",
+                        },
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            users = data.get("data", [])
+                            if not users:
+                                await interaction.followup.send(
+                                    f"❌ Twitch channel `{channel_login}` not found. "
+                                    "Check the spelling and try again.",
+                                    ephemeral=True,
+                                )
+                                return
+                            broadcaster_id = int(users[0]["id"])
+                        else:
+                            log.warning(
+                                "Helix /users lookup failed: HTTP %s", resp.status
+                            )
+                            await interaction.followup.send(
+                                "⚠️ Could not verify the Twitch channel (Helix API error). "
+                                "The channel name has been saved anyway — double-check it's correct.",
+                                ephemeral=True,
+                            )
+            except Exception as exc:
+                log.warning("Helix channel lookup error: %s", exc)
+    else:
+        # No Twitch credentials — skip validation, accept the channel name as-is.
+        pass
+
+    # Upsert guild_twitch_config.
+    await db.execute(
+        """
+        INSERT INTO guild_twitch_config (guild_id, twitch_channel, twitch_broadcaster_id)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            twitch_channel        = excluded.twitch_channel,
+            twitch_broadcaster_id = excluded.twitch_broadcaster_id
+        """,
+        (guild.id, channel_login, broadcaster_id),
+    )
+    await db.commit()
+
+    # Tell the live Twitch client to join the channel (no restart needed).
+    if twitch_enabled and twitch_client is not None:
+        try:
+            tc = twitch_client  # type: ignore[assignment]
+            existing = [ch.name.lower() for ch in tc.connected_channels]
+            if channel_login not in existing:
+                await tc.join_channels([channel_login])
+                log.info("Twitch client joined channel: %s", channel_login)
+        except Exception as exc:
+            log.warning("Failed to join Twitch channel at runtime: %s", exc)
+
+    embed = discord.Embed(
+        title="Twitch Setup",
+        description=(
+            f"Twitch channel **{channel_login}** linked to **{guild.name}**.\n"
+            "Members who link their Twitch account via `/twitch-link` will now earn "
+            "Discord XP by chatting in that channel."
+        ),
+        color=discord.Color.purple(),
+        timestamp=utcnow(),
+    )
+    if broadcaster_id:
+        embed.add_field(name="Broadcaster ID", value=str(broadcaster_id))
+    embed.set_footer(text=f"Configured by {interaction.user}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await send_mod_log(guild, embed)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 8: Twitch integration — /twitch-link (all members)
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="twitch-link",
+    description="Link your Twitch account to earn XP from Twitch chat.",
+)
+async def twitch_link(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    discord_user_id = interaction.user.id
+
+    # Check whether this guild has a Twitch channel configured.
+    async with db.execute(
+        "SELECT twitch_channel FROM guild_twitch_config WHERE guild_id = ?",
+        (guild.id,),
+    ) as cur:
+        cfg_row = await cur.fetchone()
+
+    if cfg_row is None or not cfg_row["twitch_channel"]:
+        await interaction.followup.send(
+            "⚠️ This server hasn't set up a Twitch channel yet. "
+            "Ask an admin to run `/twitch-setup` first.",
+            ephemeral=True,
+        )
+        return
+
+    twitch_channel = cfg_row["twitch_channel"]
+
+    # Check if the user already has a linked account (just informational).
+    async with db.execute(
+        "SELECT twitch_login FROM linked_accounts WHERE discord_user_id = ?",
+        (discord_user_id,),
+    ) as cur:
+        existing_link = await cur.fetchone()
+
+    already_linked_msg = ""
+    if existing_link:
+        already_linked_msg = (
+            f"You currently have Twitch account **{existing_link['twitch_login']}** linked. "
+            "Completing the steps below will re-link with the new account.\n\n"
+        )
+
+    # Generate a one-time code.
+    code = secrets.token_hex(3).upper()  # 6 hex chars, e.g. "A3F7C2"
+    now = utcnow()
+    expires_at = now + timedelta(minutes=10)
+
+    # Clean up any previous pending codes for this Discord user first.
+    await db.execute(
+        "DELETE FROM pending_link_codes WHERE discord_user_id = ?", (discord_user_id,)
+    )
+    await db.execute(
+        """
+        INSERT INTO pending_link_codes (code, discord_user_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (code, discord_user_id, now.isoformat(), expires_at.isoformat()),
+    )
+    await db.commit()
+
+    instructions = (
+        f"{already_linked_msg}"
+        f"To link your Twitch account, type the following in the "
+        f"**[{twitch_channel}](https://twitch.tv/{twitch_channel})** Twitch chat:\n\n"
+        f"```\n!link {code}\n```\n"
+        f"This code expires in **10 minutes**. Do not share it."
+    )
+
+    # Try to DM the user.
+    dm_sent = False
+    try:
+        await interaction.user.send(
+            f"**Bams Modmin Tools — Twitch Link**\n\n{instructions}"
+        )
+        dm_sent = True
+    except discord.Forbidden:
+        pass  # DMs closed — fall back to the ephemeral reply
+    except discord.HTTPException as exc:
+        log.warning("Failed to DM twitch-link code to %s: %s", discord_user_id, exc)
+
+    if dm_sent:
+        reply = (
+            "Check your DMs for your link code and instructions!\n"
+            f"_(If you didn't receive a DM, your code is: `{code}` — "
+            f"type `!link {code}` in **{twitch_channel}** on Twitch.)_"
+        )
+    else:
+        reply = (
+            "**Your DMs appear to be closed**, so here are your instructions:\n\n"
+            + instructions
+        )
+
+    await interaction.followup.send(reply, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 8: Twitch integration — /twitch-unlink (all members)
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="twitch-unlink",
+    description="Remove the link between your Discord and Twitch accounts.",
+)
+async def twitch_unlink(interaction: discord.Interaction) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    discord_user_id = interaction.user.id
+
+    async with db.execute(
+        "SELECT twitch_login FROM linked_accounts WHERE discord_user_id = ?",
+        (discord_user_id,),
+    ) as cur:
+        row = await cur.fetchone()
+
+    if row is None:
+        await interaction.followup.send(
+            "You don't have a linked Twitch account.", ephemeral=True
+        )
+        return
+
+    twitch_login = row["twitch_login"]
+    await db.execute(
+        "DELETE FROM linked_accounts WHERE discord_user_id = ?", (discord_user_id,)
+    )
+    await db.commit()
+
+    await interaction.followup.send(
+        f"Your Twitch account **{twitch_login}** has been unlinked from your Discord account.",
+        ephemeral=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Global error handler for slash commands
 # --------------------------------------------------------------------------- #
 
@@ -1542,15 +2251,27 @@ async def on_app_command_error(
 
 
 # --------------------------------------------------------------------------- #
-# Entry point
+# Entry point — async main running Discord + Twitch concurrently
 # --------------------------------------------------------------------------- #
 
 
-def main() -> None:
+async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set. Copy .env.example to .env and add your token.")
-    bot.run(BOT_TOKEN, log_handler=None)
+
+    if not twitch_enabled:
+        if not _TWITCHIO_AVAILABLE:
+            log.info("Twitch integration disabled (twitchio not installed)")
+        else:
+            log.info("Twitch integration disabled (missing config: "
+                     "need TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, TWITCH_BOT_USERNAME, "
+                     "TWITCH_BOT_ACCESS_TOKEN, TWITCH_BOT_REFRESH_TOKEN)")
+
+    # Run the Discord bot. The Twitch client (if enabled) is started as a
+    # background task from on_ready, after setup_hook has opened the DB.
+    async with bot:
+        await bot.start(BOT_TOKEN)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
