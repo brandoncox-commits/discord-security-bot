@@ -56,6 +56,7 @@ regardless of whether the stream is live.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -63,6 +64,7 @@ import random
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import aiosqlite
@@ -70,6 +72,14 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
+
+# Card notification modules (optional — Pillow may not be installed yet).
+try:
+    from image_intake import ingest_image_url, ImageIntakeError
+    from card_renderer import render_card
+    _CARDS_AVAILABLE = True
+except ImportError:
+    _CARDS_AVAILABLE = False
 
 # Graceful degradation: twitchio is optional.
 try:
@@ -431,6 +441,26 @@ class ModminBot(commands.Bot):
         await self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_pending_twitch_setup_broadcaster
             ON pending_twitch_setup (twitch_broadcaster_id)
+        """)
+
+        # --- Phase 4 tables (Card notification system) --- #
+        # Per-guild configuration for go-live card notifications.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS guild_card_config (
+                guild_id                INTEGER PRIMARY KEY,
+                -- Discord channel ID where go-live cards are posted.
+                announce_channel_id     INTEGER,
+                -- Mention setting: 0=none, -1=@everyone, positive int=role ID.
+                mention_setting         INTEGER NOT NULL DEFAULT 0,
+                -- Custom message line shown on the card and in the post text.
+                custom_message          TEXT NOT NULL DEFAULT 'is now LIVE on Twitch!',
+                -- URL supplied by the admin for the background image.
+                background_url          TEXT,
+                -- Local cache path of the validated background image.
+                background_cache_path   TEXT,
+                -- ISO-8601 timestamp of last background ingestion (for staleness checks).
+                background_cached_at    TEXT
+            )
         """)
 
         await self.db.commit()
@@ -838,6 +868,12 @@ async def _channel_is_live(channel_name: str) -> bool:
 
 twitch_client: Optional[object] = None  # set below if twitch_enabled
 
+# Debounce: maps broadcaster_id → UTC timestamp of last go-live notification.
+# Prevents re-announcing the same stream within GOLIVE_DEBOUNCE_MINUTES of its
+# previous notification (handles Twitch stream start flapping).
+_golive_last_notified: dict[int, datetime] = {}
+GOLIVE_DEBOUNCE_MINUTES: int = 10
+
 if twitch_enabled:
     class TwitchBot(twitch_commands.Bot):
         """twitchio 2.x Bot that awards Discord XP for Twitch chat messages."""
@@ -965,6 +1001,13 @@ if twitch_enabled:
 
                     # Atomic replacement.
                     self.live_broadcasters = new_live
+
+                    # Dispatch go-live card notifications for newly-live broadcasters.
+                    if went_live and db is not None:
+                        for bid in went_live:
+                            asyncio.create_task(
+                                _dispatch_golive_notification(db, bid, token)
+                            )
 
                 except Exception as exc:
                     # Catch-all: log and continue so the loop never dies.
@@ -1348,6 +1391,309 @@ if twitch_enabled:
 
 
 # --------------------------------------------------------------------------- #
+# Go-live card notification dispatcher
+# --------------------------------------------------------------------------- #
+
+
+async def _fetch_twitch_avatar_bytes(
+    broadcaster_login: str, token: Optional[str]
+) -> Optional[bytes]:
+    """Best-effort fetch of the Twitch broadcaster's profile image bytes.
+
+    Returns None on any failure — the card falls back to a placeholder.
+    """
+    if not (TWITCH_CLIENT_ID and token and _AIOHTTP_AVAILABLE):
+        return None
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as session:
+            async with session.get(
+                "https://api.twitch.tv/helix/users",
+                params={"login": broadcaster_login},
+                headers={
+                    "Client-ID": TWITCH_CLIENT_ID,
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=_aio.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                users = data.get("data", [])
+                if not users:
+                    return None
+                profile_url = users[0].get("profile_image_url", "")
+                if not profile_url or not profile_url.startswith("https://"):
+                    return None
+
+            async with session.get(
+                profile_url, timeout=_aio.ClientTimeout(total=8)
+            ) as img_resp:
+                if img_resp.status != 200:
+                    return None
+                ct = img_resp.content_type.lower()
+                if not ct.startswith("image/"):
+                    return None
+                return await img_resp.read()
+    except Exception as exc:
+        log.debug("Could not fetch Twitch avatar for '%s': %s", broadcaster_login, exc)
+        return None
+
+
+async def _fetch_twitch_stream_info(
+    broadcaster_id: int, token: Optional[str]
+) -> tuple[str, str, str]:
+    """Return (display_name, login, title) for a live broadcaster.
+
+    Queries Helix /streams; falls back to empty strings on any error.
+    """
+    if not (TWITCH_CLIENT_ID and token and _AIOHTTP_AVAILABLE):
+        return ("", "", "")
+    try:
+        import aiohttp as _aio
+        async with _aio.ClientSession() as session:
+            async with session.get(
+                "https://api.twitch.tv/helix/streams",
+                params={"user_id": str(broadcaster_id)},
+                headers={
+                    "Client-ID": TWITCH_CLIENT_ID,
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=_aio.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status != 200:
+                    return ("", "", "")
+                data = await resp.json()
+                streams = data.get("data", [])
+                if not streams:
+                    return ("", "", "")
+                s = streams[0]
+                return (
+                    s.get("user_name", ""),   # display name
+                    s.get("user_login", ""),  # login name (for avatar lookup)
+                    s.get("title", ""),
+                )
+    except Exception as exc:
+        log.debug("Could not fetch stream info for broadcaster %s: %s", broadcaster_id, exc)
+        return ("", "", "")
+
+
+async def _dispatch_golive_notification(
+    db: aiosqlite.Connection,
+    broadcaster_id: int,
+    token: Optional[str],
+) -> None:
+    """Send go-live card notifications for all guilds configured for this broadcaster.
+
+    Called as a background task when a broadcaster transitions offline→live.
+    Includes debounce to prevent re-firing within GOLIVE_DEBOUNCE_MINUTES of
+    the previous notification.  Falls back to a plain embed if the card system
+    is unavailable or fails.
+    """
+    now = utcnow()
+
+    # --- Debounce check -------------------------------------------------------
+    last = _golive_last_notified.get(broadcaster_id)
+    if last is not None:
+        elapsed = (now - last).total_seconds() / 60
+        if elapsed < GOLIVE_DEBOUNCE_MINUTES:
+            log.info(
+                "go-live notify: broadcaster %s debounced (%.1f min since last)",
+                broadcaster_id, elapsed,
+            )
+            return
+
+    # --- Fetch stream metadata ------------------------------------------------
+    display_name, login_name, stream_title = await _fetch_twitch_stream_info(
+        broadcaster_id, token
+    )
+    if not display_name:
+        # Try looking up login from DB as a fallback.
+        try:
+            async with db.execute(
+                "SELECT twitch_channel FROM guild_twitch_config"
+                " WHERE twitch_broadcaster_id = ? LIMIT 1",
+                (broadcaster_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row:
+                login_name = row["twitch_channel"]
+                display_name = login_name
+        except Exception:
+            pass
+
+    if not display_name:
+        display_name = f"Broadcaster {broadcaster_id}"
+        login_name = ""
+
+    log.info(
+        "go-live notify: dispatching for broadcaster %s ('%s'), title='%s'",
+        broadcaster_id, display_name, stream_title,
+    )
+
+    # --- Fetch avatar (best-effort) ------------------------------------------
+    avatar_bytes: Optional[bytes] = None
+    if login_name:
+        avatar_bytes = await _fetch_twitch_avatar_bytes(login_name, token)
+
+    # --- Find all guilds configured for this broadcaster ---------------------
+    try:
+        async with db.execute(
+            "SELECT gtc.guild_id, gcc.announce_channel_id, gcc.mention_setting, "
+            "       gcc.custom_message, gcc.background_cache_path "
+            "FROM guild_twitch_config gtc "
+            "LEFT JOIN guild_card_config gcc ON gtc.guild_id = gcc.guild_id "
+            "WHERE gtc.twitch_broadcaster_id = ?",
+            (broadcaster_id,),
+        ) as cur:
+            guild_rows = await cur.fetchall()
+    except Exception as exc:
+        log.warning("go-live notify: DB query error for broadcaster %s: %s", broadcaster_id, exc)
+        return
+
+    if not guild_rows:
+        log.debug("go-live notify: no guilds for broadcaster %s", broadcaster_id)
+        return
+
+    # --- Record debounce timestamp before sending (prevents double-fire) ------
+    _golive_last_notified[broadcaster_id] = now
+
+    # --- Build card bytes once (reused for every guild) ----------------------
+    card_bytes: Optional[bytes] = None
+    if _CARDS_AVAILABLE:
+        try:
+            custom_msg = None
+            bg_path = None
+            for row in guild_rows:
+                if row["custom_message"]:
+                    custom_msg = row["custom_message"]
+                    bg_path = row["background_cache_path"]
+                    break
+            card_bytes = await asyncio.to_thread(
+                render_card,
+                display_name,
+                stream_title,
+                bg_path,
+                avatar_bytes,
+                custom_msg or "is now LIVE on Twitch!",
+            )
+        except Exception as exc:
+            log.warning(
+                "go-live notify: card render failed for broadcaster %s: %s; "
+                "falling back to plain embed",
+                broadcaster_id, exc,
+            )
+            card_bytes = None
+
+    # --- Send to each guild ---------------------------------------------------
+    for row in guild_rows:
+        guild_id = row["guild_id"]
+        announce_channel_id = row["announce_channel_id"]
+        mention_setting = row["mention_setting"] if row["mention_setting"] is not None else 0
+        custom_message = row["custom_message"] or "is now LIVE on Twitch!"
+        bg_path = row["background_cache_path"]
+
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            log.debug("go-live notify: bot not in guild %s, skipping", guild_id)
+            continue
+
+        # Resolve announcement channel.
+        dest: Optional[discord.TextChannel] = None
+        if announce_channel_id:
+            ch = guild.get_channel(announce_channel_id)
+            if isinstance(ch, discord.TextChannel):
+                dest = ch
+        if dest is None:
+            log.info(
+                "go-live notify: guild %s has no announcement channel configured; skipping",
+                guild_id,
+            )
+            continue
+
+        if not dest.permissions_for(guild.me).send_messages:
+            log.warning(
+                "go-live notify: no send permission in #%s (guild %s)",
+                dest.name, guild_id,
+            )
+            continue
+
+        # Build mention prefix.
+        mention_prefix = ""
+        if mention_setting == -1:
+            mention_prefix = "@everyone "
+        elif mention_setting and mention_setting > 0:
+            role = guild.get_role(mention_setting)
+            if role:
+                mention_prefix = f"{role.mention} "
+
+        twitch_url = f"https://twitch.tv/{login_name}" if login_name else "https://twitch.tv"
+        notification_text = (
+            f"{mention_prefix}**{display_name}** {custom_message}\n"
+            f"Watch at {twitch_url}"
+        )
+
+        # Build the fallback embed.
+        embed = discord.Embed(
+            title=f"{display_name} is LIVE!",
+            description=f"{custom_message}\n\n[Watch on Twitch]({twitch_url})",
+            color=discord.Color.purple(),
+            url=twitch_url,
+            timestamp=now,
+        )
+        if stream_title:
+            embed.add_field(name="Stream Title", value=stream_title, inline=False)
+        embed.set_footer(text="Twitch Live Notification")
+
+        # --- Per-guild card render (use per-guild bg_path for the image) -----
+        per_guild_card: Optional[bytes] = None
+        if _CARDS_AVAILABLE and bg_path and bg_path != (guild_rows[0]["background_cache_path"] if guild_rows else None):
+            # Different background from the one used for the shared render —
+            # re-render for this guild.
+            try:
+                per_guild_card = await asyncio.to_thread(
+                    render_card,
+                    display_name,
+                    stream_title,
+                    bg_path,
+                    avatar_bytes,
+                    custom_message,
+                )
+            except Exception as exc:
+                log.warning("go-live notify: per-guild re-render failed for guild %s: %s", guild_id, exc)
+
+        # Decide which card bytes to use.
+        use_card = per_guild_card or card_bytes
+
+        try:
+            if use_card:
+                file = discord.File(
+                    io.BytesIO(use_card),
+                    filename=f"golive_{broadcaster_id}.png",
+                )
+                embed.set_image(url=f"attachment://golive_{broadcaster_id}.png")
+                await dest.send(content=notification_text, embed=embed, file=file)
+            else:
+                # Plain embed fallback — never drop the notification.
+                await dest.send(content=notification_text, embed=embed)
+
+            log.info(
+                "go-live notify: sent to #%s in guild %s (card=%s)",
+                dest.name, guild_id, use_card is not None,
+            )
+        except discord.Forbidden:
+            log.warning(
+                "go-live notify: Forbidden posting to #%s in guild %s",
+                dest.name, guild_id,
+            )
+        except discord.HTTPException as exc:
+            log.warning(
+                "go-live notify: HTTP error posting to #%s in guild %s: %s",
+                dest.name, guild_id, exc,
+            )
+
+
+# --------------------------------------------------------------------------- #
 # /help
 # --------------------------------------------------------------------------- #
 
@@ -1388,6 +1734,13 @@ COMMAND_HELP = [
         "**!approve-xp** to confirm. Once approved, members who link their Twitch "
         "account via /twitch-link will earn Discord XP by chatting there. "
         "The request expires in 10 minutes.",
+    ),
+    (
+        "/twitch-notify",
+        "[Manage Server] Configure go-live card notifications: set the announcement "
+        "channel, mention (@everyone or a role), a custom message, and an optional "
+        "custom background image URL. When the linked Twitch channel goes live the bot "
+        "posts a notification card in the chosen channel.",
     ),
     (
         "/rank [user]",
@@ -2741,6 +3094,221 @@ async def twitch_unlink(interaction: discord.Interaction) -> None:
         f"Your Twitch account **{twitch_login}** has been unlinked from your Discord account.",
         ephemeral=True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Feature 9: Twitch go-live card notifications — /twitch-notify
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="twitch-notify",
+    description="Configure go-live card notifications for the linked Twitch channel.",
+)
+@app_commands.describe(
+    announce_channel="Channel where go-live cards will be posted.",
+    mention="Who to ping: 'everyone', a role mention, or 'none' (default).",
+    custom_message="Short message shown on the card (default: 'is now LIVE on Twitch!').",
+    background_url="HTTPS URL of an image to use as the card background (max 8 MB, 4096x4096).",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def twitch_notify(
+    interaction: discord.Interaction,
+    announce_channel: Optional[discord.TextChannel] = None,
+    mention: Optional[str] = None,
+    custom_message: Optional[str] = None,
+    background_url: Optional[str] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # --- Load or create the current config row --------------------------------
+    async with db.execute(
+        "SELECT * FROM guild_card_config WHERE guild_id = ?", (guild.id,)
+    ) as cur:
+        cfg = await cur.fetchone()
+
+    # Current effective values.
+    eff_channel_id = cfg["announce_channel_id"] if cfg else None
+    eff_mention = cfg["mention_setting"] if cfg else 0
+    eff_message = cfg["custom_message"] if cfg else "is now LIVE on Twitch!"
+    eff_bg_url = cfg["background_url"] if cfg else None
+    eff_bg_path = cfg["background_cache_path"] if cfg else None
+
+    # --- Process announce_channel --------------------------------------------
+    if announce_channel is not None:
+        eff_channel_id = announce_channel.id
+
+    # --- Process mention ------------------------------------------------------
+    if mention is not None:
+        m = mention.strip().lower()
+        if m in ("none", "off", "no", ""):
+            eff_mention = 0
+        elif m in ("everyone", "@everyone"):
+            eff_mention = -1
+        else:
+            # Try to parse a role mention or ID.
+            role_id: Optional[int] = None
+            if m.startswith("<@&") and m.endswith(">"):
+                try:
+                    role_id = int(m[3:-1])
+                except ValueError:
+                    pass
+            else:
+                try:
+                    role_id = int(m)
+                except ValueError:
+                    pass
+            if role_id is not None:
+                role_obj = guild.get_role(role_id)
+                if role_obj is None:
+                    await interaction.followup.send(
+                        f"❌ Role ID `{role_id}` not found in this server.", ephemeral=True
+                    )
+                    return
+                eff_mention = role_id
+            else:
+                await interaction.followup.send(
+                    "❌ Unrecognised mention value. Use `none`, `everyone`, or a role mention/ID.",
+                    ephemeral=True,
+                )
+                return
+
+    # --- Process custom_message -----------------------------------------------
+    if custom_message is not None:
+        if len(custom_message) > 200:
+            await interaction.followup.send(
+                "❌ Custom message must be 200 characters or fewer.", ephemeral=True
+            )
+            return
+        eff_message = custom_message
+
+    # --- Process background_url -----------------------------------------------
+    bg_error: Optional[str] = None
+    if background_url is not None:
+        if not _CARDS_AVAILABLE:
+            await interaction.followup.send(
+                "⚠️ The card system is not available (Pillow is not installed on this host). "
+                "Ask the bot owner to run `pip install Pillow` in the bot's environment.",
+                ephemeral=True,
+            )
+            return
+        # Ingest and validate the URL with the full SSRF pipeline.
+        try:
+            cache_path = await ingest_image_url(
+                background_url, guild.id, purpose="golive"
+            )
+            eff_bg_url = background_url
+            eff_bg_path = str(cache_path)
+        except ImageIntakeError as exc:
+            await interaction.followup.send(
+                f"❌ Background image rejected: {exc}\n\n"
+                "Only public HTTPS image URLs are accepted (no private/LAN addresses, "
+                "max 8 MB, max 4096x4096 px).",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            log.warning("twitch-notify: unexpected image intake error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Unexpected error processing image URL: {exc}", ephemeral=True
+            )
+            return
+
+    # --- Upsert guild_card_config --------------------------------------------
+    now_iso = utcnow().isoformat()
+    await db.execute(
+        """
+        INSERT INTO guild_card_config
+            (guild_id, announce_channel_id, mention_setting, custom_message,
+             background_url, background_cache_path, background_cached_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            announce_channel_id   = COALESCE(excluded.announce_channel_id,   announce_channel_id),
+            mention_setting       = excluded.mention_setting,
+            custom_message        = excluded.custom_message,
+            background_url        = COALESCE(excluded.background_url,        background_url),
+            background_cache_path = COALESCE(excluded.background_cache_path, background_cache_path),
+            background_cached_at  = CASE
+                WHEN excluded.background_cache_path IS NOT NULL
+                THEN excluded.background_cached_at
+                ELSE background_cached_at
+            END
+        """,
+        (
+            guild.id,
+            eff_channel_id,
+            eff_mention,
+            eff_message,
+            eff_bg_url if background_url is not None else None,
+            eff_bg_path if background_url is not None else None,
+            now_iso if background_url is not None else None,
+        ),
+    )
+    await db.commit()
+
+    # --- Build confirmation embed --------------------------------------------
+    channel_display = f"<#{eff_channel_id}>" if eff_channel_id else "*(not set)*"
+    if eff_mention == 0:
+        mention_display = "none"
+    elif eff_mention == -1:
+        mention_display = "@everyone"
+    else:
+        r = guild.get_role(eff_mention)
+        mention_display = r.mention if r else f"<@&{eff_mention}>"
+
+    bg_display = "*(not set)*"
+    if background_url is not None and eff_bg_path:
+        bg_display = f"Cached from: `{background_url[:80]}{'...' if len(background_url) > 80 else ''}`"
+    elif eff_bg_url:
+        bg_display = f"`{eff_bg_url[:80]}{'...' if len(eff_bg_url) > 80 else ''}`"
+
+    embed = discord.Embed(
+        title="Twitch Go-Live Notification Config",
+        color=discord.Color.purple(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Announcement Channel", value=channel_display, inline=False)
+    embed.add_field(name="Mention / Ping", value=mention_display)
+    embed.add_field(name="Custom Message", value=f'"{eff_message}"', inline=False)
+    embed.add_field(name="Background Image", value=bg_display, inline=False)
+    if not _CARDS_AVAILABLE:
+        embed.add_field(
+            name="Note",
+            value="Pillow is not installed — notifications will use plain embeds only.",
+            inline=False,
+        )
+    embed.set_footer(text=f"Configured by {interaction.user}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # Audit log.
+    log_embed = discord.Embed(
+        title="Twitch Notify Config Updated",
+        description=f"{interaction.user.mention} updated go-live notification settings.",
+        color=discord.Color.purple(),
+        timestamp=utcnow(),
+    )
+    log_embed.add_field(name="Channel", value=channel_display)
+    log_embed.add_field(name="Mention", value=mention_display)
+    log_embed.add_field(name="Message", value=f'"{eff_message}"')
+    log_embed.add_field(name="Background", value=bg_display, inline=False)
+    log_embed.set_footer(text=f"Action by {interaction.user}")
+    await send_mod_log(guild, log_embed)
 
 
 # --------------------------------------------------------------------------- #

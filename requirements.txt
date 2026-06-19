@@ -2,3 +2,5 @@ discord.py>=2.4.0
 python-dotenv>=1.0.0
 aiosqlite>=0.20.0
 twitchio>=2.9,<3
+Pillow>=10.0.0
+certifi>=2024.0.0

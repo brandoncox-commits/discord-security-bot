@@ -1,0 +1,13 @@
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+
+Copyright 2012 Google LLC (https://www.google.com/)
+
+NotoSans-Regular.ttf and NotoSans-Bold.ttf are part of the Noto Fonts project
+by Google. Source: https://github.com/googlefonts/noto-fonts
+
+SIL Open Font License, Version 1.1:
+https://scripts.sil.org/OFL
+
+You are free to use, study, modify and redistribute this Font Software
+in any font-embedding or derivative work, subject to the conditions of
+the SIL OFL 1.1. The fonts may not be sold by themselves.
