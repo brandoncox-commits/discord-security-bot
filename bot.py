@@ -914,8 +914,6 @@ async def _announce_level_up(
                 io.BytesIO(card_png),
                 filename=f"levelup_{user_id}.png",
             )
-            embed.set_image(url=f"attachment://levelup_{user_id}.png")
-            embed.set_thumbnail(url=None)  # card image supersedes thumbnail
         except Exception as exc:
             log.warning(
                 "_announce_level_up: card render failed for user %s: %s; "
@@ -927,7 +925,7 @@ async def _announce_level_up(
     # --- Send ----------------------------------------------------------------
     try:
         if card_file is not None:
-            await dest.send(embed=embed, file=card_file)
+            await dest.send(content=f"🎉 {member.mention} reached **level {new_level}**!", file=card_file)
         else:
             await dest.send(embed=embed)
     except discord.HTTPException as exc:
@@ -1977,8 +1975,7 @@ async def _dispatch_golive_notification(
                     io.BytesIO(use_card),
                     filename=f"golive_{broadcaster_id}.png",
                 )
-                embed.set_image(url=f"attachment://golive_{broadcaster_id}.png")
-                await dest.send(content=notification_text, embed=embed, file=file)
+                await dest.send(content=notification_text, file=file)
             else:
                 # Plain embed fallback — never drop the notification.
                 await dest.send(content=notification_text, embed=embed)
@@ -2996,9 +2993,6 @@ async def rank(
                         io.BytesIO(card_png),
                         filename=f"rank_{user_id}.png",
                     )
-                    embed.set_image(url=f"attachment://rank_{user_id}.png")
-                    # Remove the thumbnail so it doesn't compete with the card image.
-                    embed.set_thumbnail(url=None)
                 except Exception as exc:
                     log.warning(
                         "rank: card render failed for user %s: %s; falling back to plain embed",
@@ -3007,7 +3001,7 @@ async def rank(
                     card_file = None
 
         if card_file is not None:
-            await interaction.followup.send(embed=embed, file=card_file)
+            await interaction.followup.send(file=card_file)
         else:
             await interaction.followup.send(embed=embed)
 
