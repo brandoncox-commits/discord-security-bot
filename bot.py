@@ -83,7 +83,7 @@ from dotenv import load_dotenv
 # Card notification modules (optional — Pillow may not be installed yet).
 try:
     from image_intake import ingest_image_url, ImageIntakeError
-    from card_renderer import render_card, render_rank_card
+    from card_renderer import render_card, render_rank_card, render_levelup_card
     _CARDS_AVAILABLE = True
 except ImportError:
     _CARDS_AVAILABLE = False
@@ -491,6 +491,24 @@ class ModminBot(commands.Bot):
                 )
                 log.info("Migrated guild_card_config: added %s column", _col)
 
+        # Additive migration: add level-up banner columns to guild_card_config
+        # rows created before Phase 3 (Level-Up Banners) was added.
+        # Re-query after the rank-background migration so gcc_cols is fresh.
+        async with self.db.execute("PRAGMA table_info(guild_card_config)") as cur:
+            gcc_cols = {row["name"] for row in await cur.fetchall()}
+        for _col in (
+            "levelup_background_url",
+            "levelup_background_cache_path",
+            "levelup_background_cached_at",
+            "levelup_announce_channel_id",
+            "levelup_message",
+        ):
+            if _col not in gcc_cols:
+                await self.db.execute(
+                    f"ALTER TABLE guild_card_config ADD COLUMN {_col} TEXT"
+                )
+                log.info("Migrated guild_card_config: added %s column", _col)
+
         await self.db.commit()
         log.info("XP database ready at %s", XP_DB_FILE)
 
@@ -758,14 +776,73 @@ async def _announce_level_up(
     level_up_channel_id: Optional[int],
     fallback_channel: Optional[discord.TextChannel] = None,
 ) -> None:
-    """Post a public level-up message. Best-effort; swallows all HTTP errors.
+    """Post a level-up announcement.  Best-effort; swallows all HTTP errors.
+
+    Tries in order:
+      1. Render a level-up banner card and post it to the configured level-up
+         announce channel (from guild_card_config.levelup_announce_channel_id).
+      2. If the card system is unavailable or rendering fails, post a plain
+         embed to the same channel.
+      3. If no levelup channel is configured in guild_card_config, fall back to
+         guild_xp_config.level_up_channel_id or the Discord message channel.
+
+    A per-user debounce (LEVELUP_DEBOUNCE_SECS) is applied before any network
+    work to collapse rapid consecutive level-ups (e.g. from an XP burst) into
+    a single announcement for the highest level reached.
 
     Works for both Discord messages (pass fallback_channel) and Twitch-triggered
-    level-ups (fallback_channel=None, falls back to first writable channel or skips).
+    level-ups (fallback_channel=None).
     """
-    # Resolve the destination channel.
+    user_id: int = member.id
+
+    # --- Debounce check -------------------------------------------------------
+    now = utcnow()
+    debounce_key = (guild.id, user_id)
+    last_announced = _levelup_last_notified.get(debounce_key)
+    if last_announced is not None:
+        elapsed = (now - last_announced).total_seconds()
+        if elapsed < LEVELUP_DEBOUNCE_SECS:
+            log.debug(
+                "level-up debounced for user %s guild %s (%.1fs since last)",
+                user_id, guild.id, elapsed,
+            )
+            return
+    _levelup_last_notified[debounce_key] = now
+
+    db = bot.db
+
+    # --- Try to load level-up card config from guild_card_config ---------------
+    levelup_channel_id: Optional[int] = None
+    levelup_bg_path: Optional[str] = None
+    levelup_message: str = "{mention} just levelled up!"
+
+    if db is not None:
+        try:
+            async with db.execute(
+                "SELECT levelup_announce_channel_id, levelup_background_cache_path, "
+                "       levelup_message "
+                "FROM guild_card_config WHERE guild_id = ?",
+                (guild.id,),
+            ) as cur:
+                luc_row = await cur.fetchone()
+            if luc_row is not None:
+                if luc_row["levelup_announce_channel_id"] is not None:
+                    levelup_channel_id = int(luc_row["levelup_announce_channel_id"])
+                if luc_row["levelup_background_cache_path"]:
+                    levelup_bg_path = luc_row["levelup_background_cache_path"]
+                if luc_row["levelup_message"]:
+                    levelup_message = luc_row["levelup_message"]
+        except Exception as exc:
+            log.warning("_announce_level_up: could not read level-up card config: %s", exc)
+
+    # --- Resolve destination channel ------------------------------------------
+    # Priority: levelup-specific channel > xp level_up_channel_id > fallback_channel.
     dest: Optional[discord.TextChannel] = None
-    if level_up_channel_id:
+    if levelup_channel_id:
+        ch = guild.get_channel(levelup_channel_id)
+        if isinstance(ch, discord.TextChannel):
+            dest = ch
+    if dest is None and level_up_channel_id:
         ch = guild.get_channel(level_up_channel_id)
         if isinstance(ch, discord.TextChannel):
             dest = ch
@@ -775,20 +852,67 @@ async def _announce_level_up(
     if dest is None:
         return
 
-    # Check bot can send there.
     if not dest.permissions_for(guild.me).send_messages:
         return
 
+    # --- Build the plain embed (always; used as fallback) ----------------------
+    display_name: str = getattr(member, "display_name", str(member))
+    # Resolve {mention} and {level} placeholders in the configured message.
+    resolved_message = levelup_message.replace("{mention}", member.mention).replace(
+        "{level}", str(new_level)
+    )
+    embed = discord.Embed(
+        description=f"🎉 {member.mention} reached **level {new_level}**!\n{resolved_message}",
+        color=discord.Color.gold(),
+        timestamp=now,
+    )
+    if hasattr(member, "display_avatar") and member.display_avatar:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    embed.set_footer(text=f"{guild.name} XP System")
+
+    # --- Attempt to render the banner card if configured ----------------------
+    card_file: Optional[discord.File] = None
+    if _CARDS_AVAILABLE and levelup_bg_path:
+        try:
+            # Fetch the Discord avatar bytes.
+            avatar_bytes: Optional[bytes] = None
+            if hasattr(member, "display_avatar") and member.display_avatar:
+                try:
+                    avatar_bytes = await member.display_avatar.read()
+                except Exception as av_exc:
+                    log.debug(
+                        "_announce_level_up: could not fetch avatar for user %s: %s",
+                        user_id, av_exc,
+                    )
+
+            card_png = await asyncio.to_thread(
+                render_levelup_card,
+                display_name,
+                new_level,
+                levelup_bg_path,
+                avatar_bytes,
+                resolved_message,
+            )
+            card_file = discord.File(
+                io.BytesIO(card_png),
+                filename=f"levelup_{user_id}.png",
+            )
+            embed.set_image(url=f"attachment://levelup_{user_id}.png")
+            embed.set_thumbnail(url=None)  # card image supersedes thumbnail
+        except Exception as exc:
+            log.warning(
+                "_announce_level_up: card render failed for user %s: %s; "
+                "falling back to plain embed",
+                user_id, exc,
+            )
+            card_file = None
+
+    # --- Send ----------------------------------------------------------------
     try:
-        embed = discord.Embed(
-            description=f"🎉 {member.mention} reached **level {new_level}**!",
-            color=discord.Color.gold(),
-            timestamp=utcnow(),
-        )
-        if hasattr(member, "display_avatar") and member.display_avatar:
-            embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"{guild.name} XP System")
-        await dest.send(embed=embed)
+        if card_file is not None:
+            await dest.send(embed=embed, file=card_file)
+        else:
+            await dest.send(embed=embed)
     except discord.HTTPException as exc:
         log.warning("Level-up announcement failed: %s", exc)
 
@@ -901,6 +1025,16 @@ twitch_client: Optional[object] = None  # set below if twitch_enabled
 # previous notification (handles Twitch stream start flapping).
 _golive_last_notified: dict[int, datetime] = {}
 GOLIVE_DEBOUNCE_MINUTES: int = 10
+
+# Level-up debounce: maps (guild_id, user_id) → UTC timestamp of last banner.
+# Collapses rapid consecutive level-ups (e.g. Twitch message burst during an
+# XP spike) into at most one banner every LEVELUP_DEBOUNCE_SECS seconds.
+# The XP cooldown makes rapid multi-level-ups from a single source very rare,
+# but can happen if a user was near two level boundaries or the Twitch multiplier
+# is high.  30 seconds is long enough to absorb a burst but short enough that a
+# genuine second level-up reached later in the same session still gets announced.
+_levelup_last_notified: dict[tuple[int, int], datetime] = {}
+LEVELUP_DEBOUNCE_SECS: int = 30
 
 if twitch_enabled:
     class TwitchBot(twitch_commands.Bot):
@@ -1776,6 +1910,14 @@ COMMAND_HELP = [
         "Supply any public HTTPS image URL (max 8 MB, 4096x4096 px). The image is "
         "validated and cached securely. Once set, /rank will render a 1200x400 card "
         "showing the member's avatar, level, rank, and XP progress bar.",
+    ),
+    (
+        "/levelup-card-config",
+        "[Manage Server] Configure per-server level-up banners: set the announcement "
+        "channel, a custom congratulatory message (supports {mention} and {level} "
+        "placeholders), and an optional background image URL. When a member crosses a "
+        "level boundary (from Discord or Twitch chat XP) the bot posts a 1200x400 card "
+        "with their avatar, display name, and the new level reached.",
     ),
     (
         "/rank [user]",
@@ -3509,6 +3651,196 @@ async def rank_card_config(
         timestamp=utcnow(),
     )
     log_embed.add_field(name="Background", value=url_display, inline=False)
+    log_embed.set_footer(text=f"Action by {interaction.user}")
+    await send_mod_log(guild, log_embed)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 9c: Level-up banner config — /levelup-card-config (manage_guild)
+# --------------------------------------------------------------------------- #
+#
+# Design choice: a dedicated sibling command rather than extending /twitch-notify
+# or /rank-card-config.  Level-up banners are independent of Twitch integration
+# (they fire on both Discord and Twitch XP paths) and have their own announce
+# channel, message template, and background, so folding them into either existing
+# command would make those commands confusing.  /levelup-card-config is always
+# available regardless of whether Twitch is enabled.
+
+
+@bot.tree.command(
+    name="levelup-card-config",
+    description="Configure level-up banners: channel, custom message, and background image.",
+)
+@app_commands.describe(
+    announce_channel="Channel where level-up banners will be posted.",
+    custom_message=(
+        "Congratulatory message shown on the banner (use {mention} and {level} as "
+        "placeholders, max 200 chars). Default: '{mention} just levelled up!'"
+    ),
+    background_url="HTTPS URL of an image to use as the banner background (max 8 MB, 4096x4096).",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def levelup_card_config(
+    interaction: discord.Interaction,
+    announce_channel: Optional[discord.TextChannel] = None,
+    custom_message: Optional[str] = None,
+    background_url: Optional[str] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # --- Load current config (if any) ----------------------------------------
+    async with db.execute(
+        "SELECT levelup_announce_channel_id, levelup_background_url, "
+        "       levelup_background_cache_path, levelup_message "
+        "FROM guild_card_config WHERE guild_id = ?",
+        (guild.id,),
+    ) as cur:
+        cfg = await cur.fetchone()
+
+    eff_channel_id: Optional[int] = cfg["levelup_announce_channel_id"] if cfg else None
+    eff_bg_url: Optional[str] = cfg["levelup_background_url"] if cfg else None
+    eff_bg_path: Optional[str] = cfg["levelup_background_cache_path"] if cfg else None
+    eff_message: str = (
+        (cfg["levelup_message"] if cfg and cfg["levelup_message"] else None)
+        or "{mention} just levelled up!"
+    )
+
+    # --- Process announce_channel --------------------------------------------
+    if announce_channel is not None:
+        eff_channel_id = announce_channel.id
+
+    # --- Process custom_message ----------------------------------------------
+    if custom_message is not None:
+        if len(custom_message) > 200:
+            await interaction.followup.send(
+                "❌ Custom message must be 200 characters or fewer.", ephemeral=True
+            )
+            return
+        eff_message = custom_message
+
+    # --- Process background_url ----------------------------------------------
+    if background_url is not None:
+        if not _CARDS_AVAILABLE:
+            await interaction.followup.send(
+                "⚠️ The card system is not available (Pillow is not installed on this host). "
+                "Ask the bot owner to run `pip install Pillow` in the bot's environment.",
+                ephemeral=True,
+            )
+            return
+        try:
+            cache_path = await ingest_image_url(
+                background_url, guild.id, purpose="levelup"
+            )
+            eff_bg_url = background_url
+            eff_bg_path = str(cache_path)
+        except ImageIntakeError as exc:
+            await interaction.followup.send(
+                f"❌ Background image rejected: {exc}\n\n"
+                "Only public HTTPS image URLs are accepted (no private/LAN addresses, "
+                "max 8 MB, max 4096x4096 px).",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            log.warning("levelup-card-config: unexpected image intake error: %s", exc)
+            await interaction.followup.send(
+                f"❌ Unexpected error processing image URL: {exc}", ephemeral=True
+            )
+            return
+
+    # --- Upsert guild_card_config — touch only levelup columns ---------------
+    now_iso = utcnow().isoformat()
+    await db.execute(
+        """
+        INSERT INTO guild_card_config
+            (guild_id, mention_setting, custom_message,
+             levelup_announce_channel_id, levelup_message,
+             levelup_background_url, levelup_background_cache_path,
+             levelup_background_cached_at)
+        VALUES (?, 0, 'is now LIVE on Twitch!', ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            levelup_announce_channel_id   =
+                COALESCE(excluded.levelup_announce_channel_id,
+                         levelup_announce_channel_id),
+            levelup_message               = excluded.levelup_message,
+            levelup_background_url        =
+                COALESCE(excluded.levelup_background_url,        levelup_background_url),
+            levelup_background_cache_path =
+                COALESCE(excluded.levelup_background_cache_path, levelup_background_cache_path),
+            levelup_background_cached_at  =
+                CASE
+                    WHEN excluded.levelup_background_cache_path IS NOT NULL
+                    THEN excluded.levelup_background_cached_at
+                    ELSE levelup_background_cached_at
+                END
+        """,
+        (
+            guild.id,
+            eff_channel_id,
+            eff_message,
+            eff_bg_url if background_url is not None else None,
+            eff_bg_path if background_url is not None else None,
+            now_iso if background_url is not None else None,
+        ),
+    )
+    await db.commit()
+
+    # --- Build confirmation embed --------------------------------------------
+    channel_display = f"<#{eff_channel_id}>" if eff_channel_id else "*(not set)*"
+    bg_display = "*(not set)*"
+    if background_url is not None and eff_bg_path:
+        bg_display = f"Cached from: `{background_url[:80]}{'...' if len(background_url) > 80 else ''}`"
+    elif eff_bg_url:
+        bg_display = f"`{eff_bg_url[:80]}{'...' if len(eff_bg_url) > 80 else ''}`"
+
+    embed = discord.Embed(
+        title="Level-Up Banner Config",
+        color=discord.Color.gold(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Announcement Channel", value=channel_display, inline=False)
+    embed.add_field(name="Custom Message", value=f'"{eff_message}"', inline=False)
+    embed.add_field(name="Background Image", value=bg_display, inline=False)
+    embed.add_field(
+        name="Placeholders",
+        value="`{mention}` — pings the member  |  `{level}` — the level reached",
+        inline=False,
+    )
+    if not _CARDS_AVAILABLE:
+        embed.add_field(
+            name="Note",
+            value="Pillow is not installed — banners will use plain embeds only.",
+            inline=False,
+        )
+    embed.set_footer(text=f"Configured by {interaction.user}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # --- Audit log -----------------------------------------------------------
+    log_embed = discord.Embed(
+        title="Level-Up Banner Config Updated",
+        description=f"{interaction.user.mention} updated level-up banner settings.",
+        color=discord.Color.gold(),
+        timestamp=utcnow(),
+    )
+    log_embed.add_field(name="Channel", value=channel_display)
+    log_embed.add_field(name="Message", value=f'"{eff_message}"', inline=False)
+    log_embed.add_field(name="Background", value=bg_display, inline=False)
     log_embed.set_footer(text=f"Action by {interaction.user}")
     await send_mod_log(guild, log_embed)
 

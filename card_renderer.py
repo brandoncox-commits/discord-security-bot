@@ -472,3 +472,166 @@ def _draw_rank_placeholder_avatar(bg: "Image.Image") -> None:
         outline=(255, 255, 255, 180),
         width=4,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Level-up banner layout constants
+# --------------------------------------------------------------------------- #
+
+LEVELUP_AVATAR_SIZE: int = 160
+LEVELUP_AVATAR_X: int = 40
+LEVELUP_AVATAR_Y: int = 120         # centres vertically in 400px card
+LEVELUP_TEXT_X: int = 230           # text block starts after avatar
+
+
+def render_levelup_card(
+    display_name: str,
+    new_level: int,
+    background_path: Optional[str],
+    avatar_bytes: Optional[bytes],
+    custom_message: str = "just levelled up!",
+) -> bytes:
+    """Composite a level-up banner card and return PNG bytes.
+
+    Parameters
+    ----------
+    display_name : str
+        The member's Discord display name (truncated if needed).
+    new_level : int
+        The level the member just reached (displayed prominently).
+    background_path : str | None
+        Path to a cached background image (from image_intake, purpose="levelup").
+        If None or invalid, the solid-colour fallback is used.
+    avatar_bytes : bytes | None
+        Raw image bytes for the member's Discord avatar.
+        If None, a placeholder circle is drawn instead.
+    custom_message : str
+        Configurable congratulatory line shown below the level number.
+        Supports a plain string; mention/level substitution is done by the
+        caller before passing here.
+
+    Returns
+    -------
+    bytes
+        Raw PNG bytes ready to be uploaded as a Discord attachment.
+
+    Notes
+    -----
+    Layout (1200x400):
+      Left strip  : circular avatar with white ring border.
+      Top text    : display name (bold, large).
+      Middle text : "LEVEL  <N>" — the level number very large so it dominates.
+      Bottom text : custom_message line (smaller, configurable).
+      Top-right   : gold "LEVEL UP" badge.
+    Must always be called from asyncio.to_thread(...) — Pillow is synchronous.
+    """
+    from PIL import Image, ImageDraw
+
+    # ---- 1. Background -------------------------------------------------------
+    bg = _bg_from_path(background_path)
+
+    # ---- 2. Dark overlay for legibility --------------------------------------
+    overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle([(0, 0), (CARD_W, CARD_H)], fill=(0, 0, 0, 150))
+    bg = Image.alpha_composite(bg, overlay)
+
+    # ---- 3. Avatar -----------------------------------------------------------
+    if avatar_bytes:
+        try:
+            import io as _io
+            av_img = Image.open(_io.BytesIO(avatar_bytes)).convert("RGBA")
+            av_img = av_img.resize((LEVELUP_AVATAR_SIZE, LEVELUP_AVATAR_SIZE), Image.LANCZOS)
+            mask = _circular_mask(LEVELUP_AVATAR_SIZE)
+            av_base = Image.new("RGBA", (LEVELUP_AVATAR_SIZE, LEVELUP_AVATAR_SIZE), (0, 0, 0, 0))
+            av_base.paste(av_img, mask=mask)
+            # Gold border ring to distinguish from the rank card's white ring.
+            ring = Image.new("RGBA", (LEVELUP_AVATAR_SIZE + 8, LEVELUP_AVATAR_SIZE + 8), (0, 0, 0, 0))
+            ring_draw = ImageDraw.Draw(ring)
+            ring_draw.ellipse(
+                (0, 0, LEVELUP_AVATAR_SIZE + 7, LEVELUP_AVATAR_SIZE + 7),
+                fill=(255, 215, 0, 230),   # gold
+            )
+            bg.paste(ring, (LEVELUP_AVATAR_X - 4, LEVELUP_AVATAR_Y - 4), ring)
+            bg.paste(av_base, (LEVELUP_AVATAR_X, LEVELUP_AVATAR_Y), av_base)
+        except Exception as exc:
+            log.warning("card_renderer: levelup avatar render failed: %s", exc)
+            _draw_levelup_placeholder_avatar(bg)
+    else:
+        _draw_levelup_placeholder_avatar(bg)
+
+    # ---- 4. Text block -------------------------------------------------------
+    draw = ImageDraw.Draw(bg)
+    # Larger sizes than rank card: the level number should dominate.
+    font_large, font_small, font_badge = _load_fonts(size_large=52, size_small=28)
+    # Extra-large font for the level number itself.
+    try:
+        from PIL import ImageFont
+        bold_path = FONT_DIR / "NotoSans-Bold.ttf"
+        if bold_path.exists():
+            font_level_num = ImageFont.truetype(str(bold_path), 90)
+        else:
+            font_level_num = font_large
+    except Exception:
+        font_level_num = font_large
+
+    max_text_w = CARD_W - LEVELUP_TEXT_X - 40
+
+    # Display name (bold, prominent).
+    name_text = _truncate_text(display_name or "Member", font_large, max_text_w, draw)
+    _draw_outline_text(draw, (LEVELUP_TEXT_X, 55), name_text, font_large, thickness=2)
+
+    # "LEVEL" label (small caps label above the big number).
+    _draw_text_with_shadow(
+        draw, (LEVELUP_TEXT_X, 120), "LEVEL", font_small,
+        fill=(255, 215, 0, 230),   # gold
+    )
+
+    # The actual level number — very large and centred in the remaining space.
+    level_str = str(new_level)
+    _draw_outline_text(
+        draw, (LEVELUP_TEXT_X, 148), level_str, font_level_num,
+        fill=(255, 230, 80, 255),   # bright gold-yellow
+        outline=(0, 0, 0, 255),
+        thickness=3,
+    )
+
+    # Custom message line at the bottom of the text block.
+    msg_text = _truncate_text(custom_message, font_small, max_text_w, draw)
+    _draw_text_with_shadow(
+        draw, (LEVELUP_TEXT_X, 300), msg_text, font_small,
+        fill=(220, 220, 220, 255),
+    )
+
+    # ---- 5. "LEVEL UP" badge (top-right, gold) --------------------------------
+    badge_x, badge_y = CARD_W - 160, 20
+    draw.rounded_rectangle(
+        [(badge_x, badge_y), (badge_x + 130, badge_y + 38)],
+        radius=8,
+        fill=(184, 134, 11, 230),   # dark gold
+    )
+    _draw_text_with_shadow(
+        draw, (badge_x + 10, badge_y + 6), "LEVEL UP", font_badge,
+        fill=(255, 230, 80, 255), shadow=(0, 0, 0, 140), shadow_offset=2,
+    )
+
+    # ---- 6. Encode as PNG ----------------------------------------------------
+    buf = io.BytesIO()
+    bg.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def _draw_levelup_placeholder_avatar(bg: "Image.Image") -> None:
+    """Draw a gold-tinted circular placeholder for the level-up card avatar."""
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(bg)
+    draw.ellipse(
+        [
+            (LEVELUP_AVATAR_X, LEVELUP_AVATAR_Y),
+            (LEVELUP_AVATAR_X + LEVELUP_AVATAR_SIZE, LEVELUP_AVATAR_Y + LEVELUP_AVATAR_SIZE),
+        ],
+        fill=(80, 70, 20, 200),
+        outline=(255, 215, 0, 200),
+        width=4,
+    )
