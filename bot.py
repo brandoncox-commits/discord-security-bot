@@ -315,6 +315,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("modmin-tools")
 
+
+class _MessageContentIntentFilter(logging.Filter):
+    """Drop discord.py's message_content-intent warning.
+
+    This bot uses slash commands only and never reads message text, so the
+    "Privileged message content intent is missing" warning is expected and
+    harmless. Filtered narrowly by substring so all other warnings survive.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "message content intent is missing" not in record.getMessage().lower()
+
+
+logging.getLogger("discord.ext.commands.bot").addFilter(_MessageContentIntentFilter())
+
 # --------------------------------------------------------------------------- #
 # Bot
 # --------------------------------------------------------------------------- #
