@@ -1,22 +1,34 @@
 """
-card_renderer.py — Pillow-based go-live card compositor.
+card_renderer.py — Pillow-based card compositor.
 
-Produces a 1200x400 PNG card with:
-  • A full-bleed background image (or a solid fallback gradient).
-  • A semi-transparent dark overlay so text is always legible.
-  • Circular avatar in the top-left area.
-  • Broadcaster display name (bold, large).
-  • Stream title (regular, smaller, truncated).
-  • A "LIVE" badge.
-  • All text with a drop-shadow / outline for legibility over any background.
+Produces 1200x400 PNG cards:
+
+  render_card() — go-live notification card with:
+    • A full-bleed background image (or a solid fallback gradient).
+    • A semi-transparent dark overlay so text is always legible.
+    • Circular avatar in the top-left area.
+    • Broadcaster display name (bold, large).
+    • Stream title (regular, smaller, truncated).
+    • A "LIVE" badge.
+    • All text with a drop-shadow / outline for legibility over any background.
+
+  render_rank_card() — XP rank card with:
+    • A full-bleed background image (or a solid dark fallback).
+    • A semi-transparent dark overlay for legibility.
+    • Circular user avatar (left side).
+    • Display name (bold, large, truncated).
+    • Level badge.
+    • Server rank position.
+    • XP progress bar (current/next XP text alongside).
+    • All text with shadow/outline.
 
 Fonts: NotoSans-Regular and NotoSans-Bold from assets/fonts/ (OFL 1.1 license).
 These must be present; if not, falls back to Pillow's default bitmap font
 (legibility is reduced but the card still renders).
 
-IMPORTANT: render_card() must always be called from outside the event loop via
-    asyncio.to_thread(render_card, ...)
-because Pillow is CPU-bound and synchronous.
+IMPORTANT: render_card() and render_rank_card() must always be called from
+outside the event loop via asyncio.to_thread(...) because Pillow is CPU-bound
+and synchronous.
 """
 
 from __future__ import annotations
@@ -167,25 +179,8 @@ def render_card(
     from PIL import Image, ImageDraw
 
     # ---- 1. Background -------------------------------------------------------
-    if background_path and os.path.exists(background_path):
-        try:
-            bg = Image.open(background_path).convert("RGBA")
-            # Scale to cover: preserve aspect ratio so the image fully fills
-            # the card frame, then center-crop any overflow.
-            src_w, src_h = bg.size
-            scale = max(CARD_W / src_w, CARD_H / src_h)
-            scaled_w = int(src_w * scale)
-            scaled_h = int(src_h * scale)
-            bg = bg.resize((scaled_w, scaled_h), Image.LANCZOS)
-            # Center-crop to exactly CARD_W x CARD_H.
-            left = (scaled_w - CARD_W) // 2
-            top = (scaled_h - CARD_H) // 2
-            bg = bg.crop((left, top, left + CARD_W, top + CARD_H))
-        except Exception as exc:
-            log.warning("card_renderer: could not open background '%s': %s", background_path, exc)
-            bg = _solid_bg()
-    else:
-        bg = _solid_bg()
+    # Delegate to the shared scale-to-cover helper so the logic lives once.
+    bg = _bg_from_path(background_path)
 
     # ---- 2. Dark overlay for legibility -------------------------------------
     overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
@@ -276,6 +271,204 @@ def _draw_placeholder_avatar(bg: "Image.Image") -> None:
     draw.ellipse(
         [(AVATAR_X, AVATAR_Y), (AVATAR_X + AVATAR_SIZE, AVATAR_Y + AVATAR_SIZE)],
         fill=(80, 60, 110, 200),
+        outline=(255, 255, 255, 180),
+        width=4,
+    )
+
+
+def _bg_from_path(background_path: Optional[str]) -> "Image.Image":
+    """Open a background image and scale-to-cover/center-crop to CARD_W x CARD_H.
+
+    Falls back to _solid_bg() if the path is None, missing, or unreadable.
+    Shared by render_card() and render_rank_card() so the logic is in one place.
+    """
+    from PIL import Image
+    if background_path and os.path.exists(background_path):
+        try:
+            bg = Image.open(background_path).convert("RGBA")
+            src_w, src_h = bg.size
+            scale = max(CARD_W / src_w, CARD_H / src_h)
+            scaled_w = int(src_w * scale)
+            scaled_h = int(src_h * scale)
+            bg = bg.resize((scaled_w, scaled_h), Image.LANCZOS)
+            left = (scaled_w - CARD_W) // 2
+            top = (scaled_h - CARD_H) // 2
+            bg = bg.crop((left, top, left + CARD_W, top + CARD_H))
+            return bg
+        except Exception as exc:
+            log.warning("card_renderer: could not open background '%s': %s", background_path, exc)
+    return _solid_bg()
+
+
+# --------------------------------------------------------------------------- #
+# Rank-card layout constants
+# --------------------------------------------------------------------------- #
+
+RANK_AVATAR_SIZE: int = 160      # slightly larger than go-live avatar
+RANK_AVATAR_X: int = 40
+RANK_AVATAR_Y: int = 120         # centres vertically in 400px card
+RANK_TEXT_X: int = 230           # text block starts after avatar
+
+# Progress bar geometry (sits in the lower third of the card)
+BAR_X: int = 230
+BAR_Y: int = 300
+BAR_W: int = 880     # bar fills most of the remaining width
+BAR_H: int = 28
+BAR_RADIUS: int = 14
+
+
+def render_rank_card(
+    display_name: str,
+    level: int,
+    rank_pos: int,
+    total_members: int,
+    xp_into_level: int,
+    xp_needed: int,
+    total_xp: int,
+    background_path: Optional[str],
+    avatar_bytes: Optional[bytes],
+) -> bytes:
+    """Composite a rank card and return PNG bytes.
+
+    Parameters
+    ----------
+    display_name : str
+        The member's display name (truncated if needed).
+    level : int
+        The member's current level.
+    rank_pos : int
+        The member's position in the server leaderboard (1 = top).
+    total_members : int
+        Total number of members with XP data (for the "X of Y" display).
+    xp_into_level : int
+        XP earned within the current level (progress toward next level).
+    xp_needed : int
+        Total XP required to advance from current level to next level.
+    total_xp : int
+        Cumulative XP across all levels.
+    background_path : str | None
+        Path to a cached background image (from image_intake, purpose="rank").
+        If None or invalid, a solid-colour fallback is used.
+    avatar_bytes : bytes | None
+        Raw image bytes for the user's Discord avatar.
+        If None, a placeholder circle is drawn instead.
+
+    Returns
+    -------
+    bytes
+        Raw PNG bytes ready to be uploaded as a Discord attachment.
+    """
+    from PIL import Image, ImageDraw
+
+    # ---- 1. Background -------------------------------------------------------
+    bg = _bg_from_path(background_path)
+
+    # ---- 2. Dark overlay for legibility -------------------------------------
+    overlay = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle([(0, 0), (CARD_W, CARD_H)], fill=(0, 0, 0, 155))
+    bg = Image.alpha_composite(bg, overlay)
+
+    # ---- 3. Avatar -----------------------------------------------------------
+    if avatar_bytes:
+        try:
+            import io as _io
+            av_img = Image.open(_io.BytesIO(avatar_bytes)).convert("RGBA")
+            av_img = av_img.resize((RANK_AVATAR_SIZE, RANK_AVATAR_SIZE), Image.LANCZOS)
+            mask = _circular_mask(RANK_AVATAR_SIZE)
+            av_base = Image.new("RGBA", (RANK_AVATAR_SIZE, RANK_AVATAR_SIZE), (0, 0, 0, 0))
+            av_base.paste(av_img, mask=mask)
+            # White border ring.
+            ring = Image.new("RGBA", (RANK_AVATAR_SIZE + 8, RANK_AVATAR_SIZE + 8), (0, 0, 0, 0))
+            ring_draw = ImageDraw.Draw(ring)
+            ring_draw.ellipse(
+                (0, 0, RANK_AVATAR_SIZE + 7, RANK_AVATAR_SIZE + 7),
+                fill=(255, 255, 255, 220),
+            )
+            bg.paste(ring, (RANK_AVATAR_X - 4, RANK_AVATAR_Y - 4), ring)
+            bg.paste(av_base, (RANK_AVATAR_X, RANK_AVATAR_Y), av_base)
+        except Exception as exc:
+            log.warning("card_renderer: rank avatar render failed: %s", exc)
+            _draw_rank_placeholder_avatar(bg)
+    else:
+        _draw_rank_placeholder_avatar(bg)
+
+    # ---- 4. Text block -------------------------------------------------------
+    draw = ImageDraw.Draw(bg)
+    font_large, font_small, font_badge = _load_fonts(size_large=54, size_small=28)
+
+    max_text_w = CARD_W - RANK_TEXT_X - 40
+
+    # Display name (bold, large).
+    name_text = _truncate_text(display_name or "Member", font_large, max_text_w, draw)
+    _draw_outline_text(draw, (RANK_TEXT_X, 60), name_text, font_large, thickness=2)
+
+    # Level label.
+    level_text = f"Level {level}"
+    _draw_text_with_shadow(
+        draw, (RANK_TEXT_X, 130), level_text, font_small,
+        fill=(230, 230, 255, 255),
+    )
+
+    # Rank label.
+    rank_text = f"Rank #{rank_pos} of {total_members}"
+    _draw_text_with_shadow(
+        draw, (RANK_TEXT_X, 168), rank_text, font_small,
+        fill=(200, 220, 200, 255),
+    )
+
+    # Total XP label.
+    xp_text = f"Total XP: {total_xp:,}"
+    _draw_text_with_shadow(
+        draw, (RANK_TEXT_X, 210), xp_text, font_small,
+        fill=(210, 210, 210, 255),
+    )
+
+    # ---- 5. XP progress bar --------------------------------------------------
+    # Background track.
+    draw.rounded_rectangle(
+        [(BAR_X, BAR_Y), (BAR_X + BAR_W, BAR_Y + BAR_H)],
+        radius=BAR_RADIUS,
+        fill=(60, 60, 60, 200),
+    )
+
+    # Filled portion.
+    if xp_needed > 0:
+        fill_ratio = max(0.0, min(1.0, xp_into_level / xp_needed))
+    else:
+        fill_ratio = 1.0
+    fill_w = max(BAR_RADIUS * 2, int(BAR_W * fill_ratio))  # keep ends round
+
+    draw.rounded_rectangle(
+        [(BAR_X, BAR_Y), (BAR_X + fill_w, BAR_Y + BAR_H)],
+        radius=BAR_RADIUS,
+        fill=(100, 160, 255, 230),   # accent blue
+    )
+
+    # Progress label below the bar.
+    progress_label = f"{xp_into_level:,} / {xp_needed:,} XP to level {level + 1}"
+    _draw_text_with_shadow(
+        draw, (BAR_X, BAR_Y + BAR_H + 6), progress_label, font_small,
+        fill=(210, 220, 255, 255),
+    )
+
+    # ---- 6. Encode as PNG ----------------------------------------------------
+    buf = io.BytesIO()
+    bg.convert("RGB").save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf.read()
+
+
+def _draw_rank_placeholder_avatar(bg: "Image.Image") -> None:
+    """Draw a plain circular placeholder for the rank-card avatar."""
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(bg)
+    draw.ellipse(
+        [
+            (RANK_AVATAR_X, RANK_AVATAR_Y),
+            (RANK_AVATAR_X + RANK_AVATAR_SIZE, RANK_AVATAR_Y + RANK_AVATAR_SIZE),
+        ],
+        fill=(60, 60, 100, 200),
         outline=(255, 255, 255, 180),
         width=4,
     )

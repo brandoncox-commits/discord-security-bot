@@ -22,6 +22,13 @@ Admin-only (require the Administrator permission, hidden from regular members):
                              that Twitch chat; the channel owner must type
                              !approve-xp there to confirm. Expires in 10 minutes.
 
+Manage Server permission (admins + server owner):
+/twitch-notify               Configure go-live card notifications (channel, mention,
+                             custom message, go-live background image).
+/rank-card-config <url>      Set a custom background image for /rank cards. Once set,
+                             /rank renders a 1200x400 card with avatar, level, rank,
+                             and XP progress bar. Requires a public HTTPS image URL.
+
 Open to all members:
 /rank [user]                 Show a member's level, XP, and server rank.
 /leaderboard                 Show the top 10 members by XP in this server.
@@ -76,7 +83,7 @@ from dotenv import load_dotenv
 # Card notification modules (optional — Pillow may not be installed yet).
 try:
     from image_intake import ingest_image_url, ImageIntakeError
-    from card_renderer import render_card
+    from card_renderer import render_card, render_rank_card
     _CARDS_AVAILABLE = True
 except ImportError:
     _CARDS_AVAILABLE = False
@@ -454,14 +461,35 @@ class ModminBot(commands.Bot):
                 mention_setting         INTEGER NOT NULL DEFAULT 0,
                 -- Custom message line shown on the card and in the post text.
                 custom_message          TEXT NOT NULL DEFAULT 'is now LIVE on Twitch!',
-                -- URL supplied by the admin for the background image.
+                -- URL supplied by the admin for the go-live background image.
                 background_url          TEXT,
-                -- Local cache path of the validated background image.
+                -- Local cache path of the validated go-live background image.
                 background_cache_path   TEXT,
-                -- ISO-8601 timestamp of last background ingestion (for staleness checks).
-                background_cached_at    TEXT
+                -- ISO-8601 timestamp of last go-live background ingestion.
+                background_cached_at    TEXT,
+                -- URL supplied by the admin for the rank-card background image.
+                rank_background_url       TEXT,
+                -- Local cache path of the validated rank-card background image.
+                rank_background_cache_path TEXT,
+                -- ISO-8601 timestamp of last rank background ingestion.
+                rank_background_cached_at  TEXT
             )
         """)
+
+        # Additive migration: add rank background columns to guild_card_config
+        # rows created before Phase 2 (Rank Cards) was added.
+        async with self.db.execute("PRAGMA table_info(guild_card_config)") as cur:
+            gcc_cols = {row["name"] for row in await cur.fetchall()}
+        for _col, _dflt in (
+            ("rank_background_url", "NULL"),
+            ("rank_background_cache_path", "NULL"),
+            ("rank_background_cached_at", "NULL"),
+        ):
+            if _col not in gcc_cols:
+                await self.db.execute(
+                    f"ALTER TABLE guild_card_config ADD COLUMN {_col} TEXT"
+                )
+                log.info("Migrated guild_card_config: added %s column", _col)
 
         await self.db.commit()
         log.info("XP database ready at %s", XP_DB_FILE)
@@ -1743,6 +1771,13 @@ COMMAND_HELP = [
         "posts a notification card in the chosen channel.",
     ),
     (
+        "/rank-card-config <background_url>",
+        "[Manage Server] Set a custom background image for /rank cards in this server. "
+        "Supply any public HTTPS image URL (max 8 MB, 4096x4096 px). The image is "
+        "validated and cached securely. Once set, /rank will render a 1200x400 card "
+        "showing the member's avatar, level, rank, and XP progress bar.",
+    ),
+    (
         "/rank [user]",
         "[All members] Show a member's current level, XP, XP needed for the next "
         "level, and their rank in the server.",
@@ -2618,6 +2653,7 @@ async def rank(
 
         rank_pos = above + 1
 
+        # Always build the embed — it serves as the fallback when no card is available.
         embed = discord.Embed(
             title=f"Rank — {target.display_name}",
             color=target.color if target.color != discord.Color.default() else discord.Color.blurple(),
@@ -2636,7 +2672,58 @@ async def rank(
         )
         embed.set_footer(text=guild.name)
 
-        await interaction.followup.send(embed=embed)
+        # Attempt to render a rank card if a background is configured.
+        card_file: Optional[discord.File] = None
+        if _CARDS_AVAILABLE:
+            async with db.execute(
+                "SELECT rank_background_cache_path FROM guild_card_config WHERE guild_id = ?",
+                (guild_id,),
+            ) as cur:
+                cfg_row = await cur.fetchone()
+            rank_bg_path: Optional[str] = (
+                cfg_row["rank_background_cache_path"] if cfg_row else None
+            )
+
+            if rank_bg_path:
+                # Fetch the user's Discord avatar bytes for the card.
+                avatar_bytes: Optional[bytes] = None
+                if target.display_avatar:
+                    try:
+                        avatar_bytes = await target.display_avatar.read()
+                    except Exception as exc:
+                        log.debug("rank: could not fetch avatar for %s: %s", user_id, exc)
+
+                try:
+                    card_png = await asyncio.to_thread(
+                        render_rank_card,
+                        target.display_name,
+                        level,
+                        rank_pos,
+                        total_members_with_xp,
+                        xp_into_level,
+                        xp_needed,
+                        total_xp,
+                        rank_bg_path,
+                        avatar_bytes,
+                    )
+                    card_file = discord.File(
+                        io.BytesIO(card_png),
+                        filename=f"rank_{user_id}.png",
+                    )
+                    embed.set_image(url=f"attachment://rank_{user_id}.png")
+                    # Remove the thumbnail so it doesn't compete with the card image.
+                    embed.set_thumbnail(url=None)
+                except Exception as exc:
+                    log.warning(
+                        "rank: card render failed for user %s: %s; falling back to plain embed",
+                        user_id, exc,
+                    )
+                    card_file = None
+
+        if card_file is not None:
+            await interaction.followup.send(embed=embed, file=card_file)
+        else:
+            await interaction.followup.send(embed=embed)
 
     except Exception as exc:
         log.warning("rank command failed for user %s: %s", user_id, exc)
@@ -3307,6 +3394,121 @@ async def twitch_notify(
     log_embed.add_field(name="Mention", value=mention_display)
     log_embed.add_field(name="Message", value=f'"{eff_message}"')
     log_embed.add_field(name="Background", value=bg_display, inline=False)
+    log_embed.set_footer(text=f"Action by {interaction.user}")
+    await send_mod_log(guild, log_embed)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 9b: Rank-card background config — /rank-card-config (manage_guild)
+# --------------------------------------------------------------------------- #
+#
+# Design choice: a dedicated sibling command rather than adding a parameter to
+# /twitch-notify.  /twitch-notify is already Twitch-specific and has four params;
+# folding rank-card config into it would make the command surface confusing.
+# /rank-card-config is always available regardless of whether Twitch integration
+# is enabled, which is cleaner for Discord-only deployments.
+
+
+@bot.tree.command(
+    name="rank-card-config",
+    description="Set a custom background image for /rank cards in this server.",
+)
+@app_commands.describe(
+    background_url="HTTPS URL of an image to use as the rank-card background (max 8 MB, 4096x4096).",
+)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def rank_card_config(
+    interaction: discord.Interaction,
+    background_url: str,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    if not _CARDS_AVAILABLE:
+        await interaction.response.send_message(
+            "⚠️ The card system is not available (Pillow is not installed on this host). "
+            "Ask the bot owner to run `pip install Pillow` in the bot's environment.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Ingest and validate the URL through the full SSRF pipeline.
+    # Use purpose="rank" so rank backgrounds cache separately from go-live ones.
+    try:
+        cache_path = await ingest_image_url(background_url, guild.id, purpose="rank")
+    except ImageIntakeError as exc:
+        await interaction.followup.send(
+            f"❌ Background image rejected: {exc}\n\n"
+            "Only public HTTPS image URLs are accepted (no private/LAN addresses, "
+            "max 8 MB, max 4096x4096 px).",
+            ephemeral=True,
+        )
+        return
+    except Exception as exc:
+        log.warning("rank-card-config: unexpected image intake error: %s", exc)
+        await interaction.followup.send(
+            f"❌ Unexpected error processing image URL: {exc}", ephemeral=True
+        )
+        return
+
+    now_iso = utcnow().isoformat()
+    bg_path_str = str(cache_path)
+
+    # Upsert guild_card_config, touching only the rank background columns.
+    await db.execute(
+        """
+        INSERT INTO guild_card_config
+            (guild_id, mention_setting, custom_message,
+             rank_background_url, rank_background_cache_path, rank_background_cached_at)
+        VALUES (?, 0, 'is now LIVE on Twitch!', ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            rank_background_url        = excluded.rank_background_url,
+            rank_background_cache_path = excluded.rank_background_cache_path,
+            rank_background_cached_at  = excluded.rank_background_cached_at
+        """,
+        (guild.id, background_url, bg_path_str, now_iso),
+    )
+    await db.commit()
+
+    url_display = f"`{background_url[:80]}{'...' if len(background_url) > 80 else ''}`"
+
+    embed = discord.Embed(
+        title="Rank Card Background Updated",
+        description=(
+            f"The rank-card background for **{guild.name}** has been updated.\n"
+            f"Members will see the new background when they use `/rank`."
+        ),
+        color=discord.Color.blurple(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Background Image", value=url_display, inline=False)
+    embed.add_field(name="Cache Path", value=f"`{bg_path_str}`", inline=False)
+    embed.set_footer(text=f"Configured by {interaction.user}")
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # Audit log.
+    log_embed = discord.Embed(
+        title="Rank Card Config Updated",
+        description=f"{interaction.user.mention} set the rank-card background.",
+        color=discord.Color.blurple(),
+        timestamp=utcnow(),
+    )
+    log_embed.add_field(name="Background", value=url_display, inline=False)
     log_embed.set_footer(text=f"Action by {interaction.user}")
     await send_mod_log(guild, log_embed)
 
