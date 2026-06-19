@@ -170,7 +170,17 @@ def render_card(
     if background_path and os.path.exists(background_path):
         try:
             bg = Image.open(background_path).convert("RGBA")
-            bg = bg.resize((CARD_W, CARD_H), Image.LANCZOS)
+            # Scale to cover: preserve aspect ratio so the image fully fills
+            # the card frame, then center-crop any overflow.
+            src_w, src_h = bg.size
+            scale = max(CARD_W / src_w, CARD_H / src_h)
+            scaled_w = int(src_w * scale)
+            scaled_h = int(src_h * scale)
+            bg = bg.resize((scaled_w, scaled_h), Image.LANCZOS)
+            # Center-crop to exactly CARD_W x CARD_H.
+            left = (scaled_w - CARD_W) // 2
+            top = (scaled_h - CARD_H) // 2
+            bg = bg.crop((left, top, left + CARD_W, top + CARD_H))
         except Exception as exc:
             log.warning("card_renderer: could not open background '%s': %s", background_path, exc)
             bg = _solid_bg()
