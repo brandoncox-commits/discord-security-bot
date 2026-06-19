@@ -44,6 +44,8 @@ env vars are absent or twitchio is not installed.
 Twitch XP (Phase 3)
 -------------------
 Twitch chat messages earn Discord XP ONLY while the linked stream is live.
+Twitch XP is boosted relative to Discord by the per-guild twitch_multiplier
+(default 2.0x, configurable via /xp-config).
 Live status is determined by polling the Helix Streams API every 60 seconds
 (GET /helix/streams?user_id=...) using the existing app access token.
 The safe default is OFFLINE: if stream status has not yet been polled or the
@@ -350,9 +352,21 @@ class ModminBot(commands.Bot):
                 xp_min             INTEGER NOT NULL DEFAULT 15,
                 xp_max             INTEGER NOT NULL DEFAULT 25,
                 cooldown_secs      INTEGER NOT NULL DEFAULT 60,
-                level_up_channel_id INTEGER
+                level_up_channel_id INTEGER,
+                -- Multiplier applied to XP earned from Twitch chat (Discord = 1.0x).
+                twitch_multiplier  REAL NOT NULL DEFAULT 2.0
             )
         """)
+        # Migration: add twitch_multiplier to guild_xp_config tables created
+        # before this column existed. Existing guilds default to a 2.0x boost.
+        async with self.db.execute("PRAGMA table_info(guild_xp_config)") as cur:
+            cols = {row["name"] for row in await cur.fetchall()}
+        if "twitch_multiplier" not in cols:
+            await self.db.execute(
+                "ALTER TABLE guild_xp_config "
+                "ADD COLUMN twitch_multiplier REAL NOT NULL DEFAULT 2.0"
+            )
+            log.info("Migrated guild_xp_config: added twitch_multiplier column")
 
         # --- Phase 2 tables (Twitch integration) ---
         # Maps a Twitch account to a Discord user globally (one row per linked pair).
@@ -570,6 +584,7 @@ async def _award_xp(
     db: aiosqlite.Connection,
     guild_id: int,
     user_id: int,
+    source: str = "discord",
 ) -> Optional[tuple[int, int, int, int]]:
     """Try to award XP to a user in a guild.
 
@@ -578,7 +593,8 @@ async def _award_xp(
 
     This is the SHARED core used by both the Discord on_message handler and the
     Twitch chat handler so the logic (cooldown, XP range, level math) stays in
-    one place.
+    one place. `source` selects the rate: "discord" awards the base range, while
+    "twitch" scales it by the guild's twitch_multiplier (default 2.0x).
     """
     config = await _get_guild_xp_config(db, guild_id)
     if not config["enabled"]:
@@ -587,6 +603,7 @@ async def _award_xp(
     cooldown_secs: int = config["cooldown_secs"]
     xp_min: int = config["xp_min"]
     xp_max: int = config["xp_max"]
+    multiplier: float = config["twitch_multiplier"] if source == "twitch" else 1.0
 
     row = await _get_user_xp_row(db, guild_id, user_id)
 
@@ -596,7 +613,8 @@ async def _award_xp(
         if (utcnow() - last).total_seconds() < cooldown_secs:
             return None  # still on cooldown
 
-    gained = random.randint(xp_min, xp_max)
+    # Roll the base range, then scale by the source multiplier (Discord = 1.0x).
+    gained = round(random.randint(xp_min, xp_max) * multiplier)
     new_xp = row["xp"] + gained
     old_level = row["level"]
     new_level = level_for_xp(new_xp)
@@ -1285,7 +1303,9 @@ if twitch_enabled:
                         continue  # bot not in this guild (yet)
 
                     try:
-                        result = await _award_xp(db, guild_id, discord_user_id)
+                        result = await _award_xp(
+                            db, guild_id, discord_user_id, source="twitch"
+                        )
                         if result is None:
                             continue  # disabled or on cooldown
 
@@ -1344,7 +1364,7 @@ COMMAND_HELP = [
     (
         "/xp-config",
         "[Admin] Configure the per-guild XP/leveling system: enable/disable, "
-        "XP range, cooldown, and level-up announcement channel.",
+        "XP range, cooldown, Twitch multiplier (default 2x), and level-up channel.",
     ),
     (
         "/twitch-setup <channel>",
@@ -2064,6 +2084,7 @@ async def trace_app(
     xp_max="Maximum XP awarded per message (default 25).",
     cooldown_secs="Seconds between XP awards per user (default 60).",
     level_up_channel="Channel for level-up announcements (leave blank to use the message channel).",
+    twitch_multiplier="Multiplier for XP earned from Twitch chat (default 2.0 = double Discord).",
 )
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
@@ -2074,6 +2095,7 @@ async def xp_config(
     xp_max: Optional[int] = None,
     cooldown_secs: Optional[int] = None,
     level_up_channel: Optional[discord.TextChannel] = None,
+    twitch_multiplier: Optional[float] = None,
 ) -> None:
     guild = interaction.guild
     if guild is None:
@@ -2102,6 +2124,9 @@ async def xp_config(
     eff_channel_id = (
         level_up_channel.id if level_up_channel is not None else cfg["level_up_channel_id"]
     )
+    eff_twitch_mult = (
+        twitch_multiplier if twitch_multiplier is not None else cfg["twitch_multiplier"]
+    )
 
     # Validate.
     errors: list[str] = []
@@ -2113,6 +2138,8 @@ async def xp_config(
         errors.append("xp_min must be <= xp_max.")
     if eff_cooldown < 0:
         errors.append("cooldown_secs must be >= 0.")
+    if eff_twitch_mult < 1:
+        errors.append("twitch_multiplier must be >= 1 (Twitch can't earn less than Discord).")
     if errors:
         await interaction.followup.send(
             "❌ Invalid configuration:\n" + "\n".join(f"• {e}" for e in errors),
@@ -2124,16 +2151,19 @@ async def xp_config(
     await db.execute(
         """
         INSERT INTO guild_xp_config
-            (guild_id, enabled, xp_min, xp_max, cooldown_secs, level_up_channel_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (guild_id, enabled, xp_min, xp_max, cooldown_secs, level_up_channel_id,
+             twitch_multiplier)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
             enabled             = excluded.enabled,
             xp_min              = excluded.xp_min,
             xp_max              = excluded.xp_max,
             cooldown_secs       = excluded.cooldown_secs,
-            level_up_channel_id = excluded.level_up_channel_id
+            level_up_channel_id = excluded.level_up_channel_id,
+            twitch_multiplier   = excluded.twitch_multiplier
         """,
-        (guild.id, eff_enabled, eff_xp_min, eff_xp_max, eff_cooldown, eff_channel_id),
+        (guild.id, eff_enabled, eff_xp_min, eff_xp_max, eff_cooldown, eff_channel_id,
+         eff_twitch_mult),
     )
     await db.commit()
 
@@ -2145,9 +2175,15 @@ async def xp_config(
         color=discord.Color.green() if eff_enabled else discord.Color.greyple(),
         timestamp=utcnow(),
     )
+    tw_min = round(eff_xp_min * eff_twitch_mult)
+    tw_max = round(eff_xp_max * eff_twitch_mult)
     embed.add_field(name="Enabled", value="Yes" if eff_enabled else "No")
-    embed.add_field(name="XP per message", value=f"{eff_xp_min}–{eff_xp_max}")
+    embed.add_field(name="Discord XP / msg", value=f"{eff_xp_min}–{eff_xp_max}")
     embed.add_field(name="Cooldown", value=f"{eff_cooldown}s")
+    embed.add_field(
+        name="Twitch XP / msg",
+        value=f"{tw_min}–{tw_max}  ({eff_twitch_mult:g}× Discord)",
+    )
     embed.add_field(name="Level-up channel", value=channel_display, inline=False)
     embed.set_footer(text=f"Updated by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
