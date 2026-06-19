@@ -17,7 +17,10 @@ Admin-only (require the Administrator permission, hidden from regular members):
 /wipe-invites                Delete all active invite links.
 /trace-app <app>             Find the user(s) behind an app/bot.
 /xp-config                   Configure the per-guild XP/leveling system.
-/twitch-setup <channel>      [Admin] Link a Twitch channel so chat earns Discord XP.
+/twitch-setup <channel>      [Server owner only] Begin the owner-consent handshake
+                             to link a Twitch channel. The bot posts a message in
+                             that Twitch chat; the channel owner must type
+                             !approve-xp there to confirm. Expires in 10 minutes.
 
 Open to all members:
 /rank [user]                 Show a member's level, XP, and server rank.
@@ -371,6 +374,24 @@ class ModminBot(commands.Bot):
                 twitch_channel        TEXT,
                 twitch_broadcaster_id INTEGER
             )
+        """)
+        # Short-lived pending channel-link requests awaiting !approve-xp in Twitch chat.
+        # The bot joins the channel temporarily so it can receive the approval message.
+        # A row here does NOT grant XP — only a guild_twitch_config row does.
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pending_twitch_setup (
+                guild_id              INTEGER PRIMARY KEY,
+                twitch_channel        TEXT,
+                twitch_broadcaster_id INTEGER,
+                requested_by_id       INTEGER,
+                requested_by_name     TEXT,
+                created_at            TEXT,
+                expires_at            TEXT
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_pending_twitch_setup_broadcaster
+            ON pending_twitch_setup (twitch_broadcaster_id)
         """)
 
         await self.db.commit()
@@ -766,6 +787,11 @@ if twitch_enabled:
             content = message.content.strip()
             channel_name = message.channel.name.lower()
 
+            # ---- !approve-xp handler (must check BEFORE XP path) ------------
+            if content.lower() == "!approve-xp":
+                await self._handle_approve_xp(message, channel_name)
+                return
+
             # ---- !link <CODE> handler ----------------------------------------
             parts = content.split()
             if len(parts) == 2 and parts[0].lower() == "!link":
@@ -874,6 +900,191 @@ if twitch_enabled:
             except Exception as exc:
                 log.warning("Twitch !link handler error: %s", exc)
 
+        async def _handle_approve_xp(
+            self,
+            message: twitchio.Message,
+            channel_name: str,
+        ) -> None:
+            """Process a !approve-xp command from Twitch chat.
+
+            Only the channel broadcaster (is_broadcaster=True) can approve.
+            Silently ignores all other chatters to avoid leaking state.
+            Finalises any non-expired pending_twitch_setup row for this channel.
+            """
+            # Ownership proof: only the real broadcaster has is_broadcaster.
+            if not getattr(message.author, "is_broadcaster", False):
+                return  # not the broadcaster — ignore silently
+
+            db = bot.db
+            if db is None:
+                return
+
+            now = utcnow()
+            try:
+                # Look up a non-expired pending row for this exact channel.
+                async with db.execute(
+                    """
+                    SELECT * FROM pending_twitch_setup
+                    WHERE twitch_channel = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (channel_name,),
+                ) as cur:
+                    pending = await cur.fetchone()
+
+                if pending is None:
+                    # No pending request at all.
+                    try:
+                        await message.channel.send(
+                            "There is no pending link request for this channel."
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                expires_at = datetime.fromisoformat(pending["expires_at"])
+                if now > expires_at:
+                    # Request expired — clean it up.
+                    await db.execute(
+                        "DELETE FROM pending_twitch_setup WHERE guild_id = ?",
+                        (pending["guild_id"],),
+                    )
+                    await db.commit()
+                    # Part if no approved config exists.
+                    await self._part_if_no_config(channel_name, pending["guild_id"])
+                    try:
+                        await message.channel.send(
+                            "The link request for this channel has expired. "
+                            "The Discord server owner can run /twitch-setup again."
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                # Verify the broadcaster ID matches the author.
+                author_id = int(message.author.id)
+                if author_id != pending["twitch_broadcaster_id"]:
+                    # Channel name matched but broadcaster ID didn't — silent.
+                    return
+
+                guild_id = pending["guild_id"]
+                guild_name: str = pending["guild_id"]  # fallback if guild not cached
+                discord_guild = bot.get_guild(guild_id)
+                if discord_guild is not None:
+                    guild_name = discord_guild.name
+
+                # Finalise: upsert guild_twitch_config and delete the pending row.
+                await db.execute(
+                    """
+                    INSERT INTO guild_twitch_config
+                        (guild_id, twitch_channel, twitch_broadcaster_id)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(guild_id) DO UPDATE SET
+                        twitch_channel        = excluded.twitch_channel,
+                        twitch_broadcaster_id = excluded.twitch_broadcaster_id
+                    """,
+                    (guild_id, channel_name, pending["twitch_broadcaster_id"]),
+                )
+                await db.execute(
+                    "DELETE FROM pending_twitch_setup WHERE guild_id = ?",
+                    (guild_id,),
+                )
+                await db.commit()
+
+                log.info(
+                    "Twitch channel '%s' approved for guild %s by broadcaster %s",
+                    channel_name, guild_id, author_id,
+                )
+
+                # Confirm in Twitch chat.
+                try:
+                    await message.channel.send(
+                        f"✅ Approved! Chatters in this channel now earn XP "
+                        f"in the Discord server '{guild_name}'."
+                    )
+                except Exception:
+                    pass
+
+                # Best-effort DM the original Discord requester.
+                requester_id = pending["requested_by_id"]
+                try:
+                    discord_requester = await bot.fetch_user(requester_id)
+                    if discord_requester:
+                        await discord_requester.send(
+                            f"Your request to link Twitch channel **{channel_name}** "
+                            f"to **{guild_name}** was approved by the channel owner. "
+                            "Chatters who link their accounts will now earn Discord XP!"
+                        )
+                except Exception:
+                    pass
+
+                # Mod-log the approval in Discord.
+                if discord_guild is not None:
+                    embed = discord.Embed(
+                        title="Twitch Channel Link Approved",
+                        description=(
+                            f"Twitch channel **{channel_name}** was approved by its "
+                            f"broadcaster and is now linked to **{discord_guild.name}**."
+                        ),
+                        color=discord.Color.green(),
+                        timestamp=utcnow(),
+                    )
+                    embed.add_field(name="Twitch Channel", value=channel_name)
+                    embed.add_field(name="Broadcaster ID", value=str(pending["twitch_broadcaster_id"]))
+                    embed.add_field(
+                        name="Originally Requested By",
+                        value=f"<@{requester_id}> ({pending['requested_by_name']})",
+                        inline=False,
+                    )
+                    await send_mod_log(discord_guild, embed)
+
+            except Exception as exc:
+                log.warning("Twitch !approve-xp handler error: %s", exc)
+
+        async def _part_if_no_config(self, channel_name: str, guild_id: int) -> None:
+            """Part a Twitch channel if there is no approved guild_twitch_config for it.
+
+            Called when a pending request expires, so the bot doesn't linger in channels
+            it was only joined to for the consent handshake.
+            """
+            db = bot.db
+            if db is None:
+                return
+            try:
+                # Check if any guild has an approved config pointing to this channel.
+                async with db.execute(
+                    "SELECT 1 FROM guild_twitch_config WHERE twitch_channel = ? LIMIT 1",
+                    (channel_name,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None:
+                    return  # still needed for an approved guild
+
+                # Check if any OTHER non-expired pending request exists for this channel.
+                async with db.execute(
+                    """
+                    SELECT 1 FROM pending_twitch_setup
+                    WHERE twitch_channel = ? AND expires_at > ?
+                    LIMIT 1
+                    """,
+                    (channel_name, utcnow().isoformat()),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row is not None:
+                    return  # another pending request is still alive
+
+                # Safe to part.
+                existing = [ch.name.lower() for ch in self.connected_channels]
+                if channel_name in existing:
+                    await self.part_channels([channel_name])
+                    log.info(
+                        "Twitch client parted channel '%s' — pending expired, no approved config",
+                        channel_name,
+                    )
+            except Exception as exc:
+                log.warning("_part_if_no_config error for channel '%s': %s", channel_name, exc)
+
         async def _handle_xp(
             self, message: twitchio.Message, channel_name: str
         ) -> None:
@@ -978,9 +1189,11 @@ COMMAND_HELP = [
     ),
     (
         "/twitch-setup <channel>",
-        "[Admin] Link a Twitch channel to this Discord server. Members who link their "
-        "Twitch account via /twitch-link will earn Discord XP by chatting in that "
-        "Twitch channel.",
+        "[Server owner only] Begin the owner-consent handshake to link a Twitch channel. "
+        "The bot posts a message in that Twitch chat asking the channel owner to type "
+        "**!approve-xp** to confirm. Once approved, members who link their Twitch "
+        "account via /twitch-link will earn Discord XP by chatting there. "
+        "The request expires in 10 minutes.",
     ),
     (
         "/rank [user]",
@@ -1948,7 +2161,7 @@ async def leaderboard(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="twitch-setup",
-    description="Link a Twitch channel to this server so chat earns Discord XP.",
+    description="[Server owner only] Start the consent handshake to link a Twitch channel (owner must type !approve-xp in chat).",
 )
 @app_commands.describe(
     channel="The Twitch channel login name (e.g. 'shroud', NOT the URL)."
@@ -1963,6 +2176,14 @@ async def twitch_setup(interaction: discord.Interaction, channel: str) -> None:
         )
         return
 
+    # Restrict to the Discord server owner only.
+    if interaction.user.id != guild.owner_id:
+        await interaction.response.send_message(
+            "⛔ Only the server owner can link a Twitch channel.",
+            ephemeral=True,
+        )
+        return
+
     db = bot.db
     if db is None:
         await interaction.response.send_message(
@@ -1970,11 +2191,18 @@ async def twitch_setup(interaction: discord.Interaction, channel: str) -> None:
         )
         return
 
+    if not twitch_enabled:
+        await interaction.response.send_message(
+            "⚠️ Twitch integration is not enabled on this bot (missing TWITCH_* env vars).",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     channel_login = channel.strip().lstrip("@").lower()
 
-    # Validate via Helix API if Twitch credentials are configured.
+    # --- Step 1: Resolve channel → broadcaster_user_id via Helix API ----------
     broadcaster_id: Optional[int] = None
     if TWITCH_CLIENT_ID and _AIOHTTP_AVAILABLE:
         app_token = await _get_app_access_token()
@@ -2001,59 +2229,142 @@ async def twitch_setup(interaction: discord.Interaction, channel: str) -> None:
                                 return
                             broadcaster_id = int(users[0]["id"])
                         else:
-                            log.warning(
-                                "Helix /users lookup failed: HTTP %s", resp.status
-                            )
+                            log.warning("Helix /users lookup failed: HTTP %s", resp.status)
                             await interaction.followup.send(
-                                "⚠️ Could not verify the Twitch channel (Helix API error). "
-                                "The channel name has been saved anyway — double-check it's correct.",
+                                "⚠️ Could not verify the Twitch channel via Helix API "
+                                f"(HTTP {resp.status}). Please try again later.",
                                 ephemeral=True,
                             )
+                            return
             except Exception as exc:
                 log.warning("Helix channel lookup error: %s", exc)
+                await interaction.followup.send(
+                    "⚠️ Could not reach the Twitch API. Please try again later.",
+                    ephemeral=True,
+                )
+                return
     else:
-        # No Twitch credentials — skip validation, accept the channel name as-is.
-        pass
+        # Twitch env vars missing — we can't do the handshake without them.
+        await interaction.followup.send(
+            "⚠️ Twitch credentials are not fully configured. "
+            "The bot owner must set TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET.",
+            ephemeral=True,
+        )
+        return
 
-    # Upsert guild_twitch_config.
+    # broadcaster_id is guaranteed non-None from here on.
+    assert broadcaster_id is not None
+
+    # --- Step 2: Upsert pending_twitch_setup with 10-minute expiry -----------
+    now = utcnow()
+    expires_at = now + timedelta(minutes=10)
     await db.execute(
         """
-        INSERT INTO guild_twitch_config (guild_id, twitch_channel, twitch_broadcaster_id)
-        VALUES (?, ?, ?)
+        INSERT INTO pending_twitch_setup
+            (guild_id, twitch_channel, twitch_broadcaster_id,
+             requested_by_id, requested_by_name, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id) DO UPDATE SET
             twitch_channel        = excluded.twitch_channel,
-            twitch_broadcaster_id = excluded.twitch_broadcaster_id
+            twitch_broadcaster_id = excluded.twitch_broadcaster_id,
+            requested_by_id       = excluded.requested_by_id,
+            requested_by_name     = excluded.requested_by_name,
+            created_at            = excluded.created_at,
+            expires_at            = excluded.expires_at
         """,
-        (guild.id, channel_login, broadcaster_id),
+        (
+            guild.id,
+            channel_login,
+            broadcaster_id,
+            interaction.user.id,
+            str(interaction.user),
+            now.isoformat(),
+            expires_at.isoformat(),
+        ),
     )
     await db.commit()
 
-    # Tell the live Twitch client to join the channel (no restart needed).
-    if twitch_enabled and twitch_client is not None:
+    # --- Step 3: Tell the live twitchio client to join the channel now --------
+    if twitch_client is not None:
         try:
             tc = twitch_client  # type: ignore[assignment]
             existing = [ch.name.lower() for ch in tc.connected_channels]
             if channel_login not in existing:
                 await tc.join_channels([channel_login])
-                log.info("Twitch client joined channel: %s", channel_login)
+                log.info("Twitch client joined channel '%s' for pending consent handshake", channel_login)
         except Exception as exc:
-            log.warning("Failed to join Twitch channel at runtime: %s", exc)
+            log.warning("Failed to join Twitch channel '%s' at runtime: %s", channel_login, exc)
 
+    # --- Step 4: Post the consent message in Twitch chat ----------------------
+    chat_post_ok = False
+    chat_post_error: Optional[str] = None
+    if twitch_client is not None:
+        try:
+            tc = twitch_client  # type: ignore[assignment]
+            # Find the channel object we just joined (or were already in).
+            ch_obj = None
+            for connected_ch in tc.connected_channels:
+                if connected_ch.name.lower() == channel_login:
+                    ch_obj = connected_ch
+                    break
+            if ch_obj is not None:
+                consent_msg = (
+                    f"[Bams Modmin Tools] The owner of Discord server '{guild.name}' "
+                    f"(requested by {interaction.user}) wants to link THIS channel so "
+                    f"chatters earn XP there. If you're the channel owner, type "
+                    f"!approve-xp to confirm. Ignore to deny. (expires in 10 min)"
+                )
+                await ch_obj.send(consent_msg)
+                chat_post_ok = True
+                log.info("Consent message posted in Twitch channel '%s'", channel_login)
+            else:
+                chat_post_error = "Bot joined but could not resolve the channel object."
+        except Exception as exc:
+            chat_post_error = str(exc)
+            log.warning("Failed to post consent message in '%s': %s", channel_login, exc)
+
+    # --- Step 5: Reply to the Discord owner ----------------------------------
+    if chat_post_ok:
+        reply = (
+            f"Request sent to Twitch channel **{channel_login}**.\n\n"
+            f"The channel owner must type `!approve-xp` in their Twitch chat to approve "
+            f"the link. The request expires in **10 minutes**.\n\n"
+            f"Once approved, members who run `/twitch-link` will earn Discord XP by "
+            f"chatting in that channel."
+        )
+    else:
+        # Chat post failed — give the owner the fallback phrase.
+        error_detail = f" ({chat_post_error})" if chat_post_error else ""
+        reply = (
+            f"⚠️ The bot couldn't post in **{channel_login}**'s Twitch chat{error_detail}.\n\n"
+            f"You can still tell the channel owner to type `!approve-xp` in their chat — "
+            f"the bot is listening and will approve the link when they do. "
+            f"The request expires in **10 minutes**."
+        )
+
+    await interaction.followup.send(reply, ephemeral=True)
+
+    # Mod-log the pending request.
     embed = discord.Embed(
-        title="Twitch Setup",
+        title="Twitch Channel Link Requested",
         description=(
-            f"Twitch channel **{channel_login}** linked to **{guild.name}**.\n"
-            "Members who link their Twitch account via `/twitch-link` will now earn "
-            "Discord XP by chatting in that channel."
+            f"A consent request was sent to Twitch channel **{channel_login}**.\n"
+            f"Waiting for the channel owner to type `!approve-xp` in chat."
         ),
         color=discord.Color.purple(),
         timestamp=utcnow(),
     )
-    if broadcaster_id:
-        embed.add_field(name="Broadcaster ID", value=str(broadcaster_id))
-    embed.set_footer(text=f"Configured by {interaction.user}")
-
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    embed.add_field(name="Twitch Channel", value=channel_login)
+    embed.add_field(name="Broadcaster ID", value=str(broadcaster_id))
+    embed.add_field(name="Requested By", value=f"{interaction.user.mention} ({interaction.user})", inline=False)
+    embed.add_field(name="Expires", value=expires_at.strftime("%Y-%m-%d %H:%M UTC"), inline=False)
+    if not chat_post_ok:
+        embed.add_field(
+            name="Note",
+            value="Bot could not post in Twitch chat; owner was given the fallback phrase.",
+            inline=False,
+        )
+    embed.set_footer(text=f"Initiated by {interaction.user}")
     await send_mod_log(guild, embed)
 
 
