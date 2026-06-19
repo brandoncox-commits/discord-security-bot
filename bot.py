@@ -5,9 +5,9 @@ Bams Modmin Tools
 A Discord moderation & security bot focused on incident response and server
 hardening. Built on discord.py 2.x using slash (application) commands.
 
-Commands (all require the Administrator permission and are hidden from members
-who lack it)
+Commands
 -----------------------------------------------------------------------------
+Admin-only (require the Administrator permission, hidden from regular members):
 /help                        Show the command list.
 /bulk-purge-user <user>      Ban a user, delete their last-14-day messages, and
                              remove webhooks they created (plus those messages).
@@ -16,6 +16,11 @@ who lack it)
 /panic <lock|unlock>         Freeze / restore all text channels during a raid.
 /wipe-invites                Delete all active invite links.
 /trace-app <app>             Find the user(s) behind an app/bot.
+/xp-config                   Configure the per-guild XP/leveling system.
+
+Open to all members:
+/rank [user]                 Show a member's level, XP, and server rank.
+/leaderboard                 Show the top 10 members by XP in this server.
 
 Setup
 -----
@@ -32,9 +37,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+import aiosqlite
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -60,6 +67,9 @@ BULK_DELETE_MAX_AGE = timedelta(days=14)
 # Persisted panic-lock state lives next to this file, keyed by guild ID, so that
 # /panic unlock can restore each channel to its EXACT pre-lock overwrite values.
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "panic_state.json")
+
+# XP database lives beside this file. Listed in .gitignore.
+XP_DB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xp.db")
 
 # The @everyone overwrites that /panic toggles.
 PANIC_PERMS = (
@@ -200,6 +210,47 @@ def assess_permissions(permissions: discord.Permissions) -> list[tuple[str, str,
     found.sort(key=lambda f: RISK_ORDER[f[1]], reverse=True)
     return found
 
+
+# --------------------------------------------------------------------------- #
+# XP / Leveling — math helpers
+# --------------------------------------------------------------------------- #
+# MEE6-style cumulative XP curve.
+#   XP required to advance FROM level n TO n+1 = 5*(n**2) + 50*n + 100
+#   e.g. level 0→1 = 100 XP, 1→2 = 155 XP, 2→3 = 220 XP, ...
+#
+# xp_for_level(n)  — cumulative XP a user needs to *be* at level n (i.e. reach it)
+# level_for_xp(xp) — the level a user is at given their cumulative XP total
+
+
+def xp_for_level(level: int) -> int:
+    """Return the cumulative XP required to reach `level` from level 0.
+
+    Uses the MEE6 formula: each step n→n+1 costs 5*(n**2) + 50*n + 100.
+    xp_for_level(0) == 0, xp_for_level(1) == 100, xp_for_level(2) == 255, ...
+    """
+    total = 0
+    for n in range(level):
+        total += 5 * (n ** 2) + 50 * n + 100
+    return total
+
+
+def level_for_xp(total_xp: int) -> int:
+    """Return the level a user is at given their cumulative XP total.
+
+    Walks up levels until the next level would require more XP than the user has.
+    """
+    level = 0
+    while True:
+        # XP needed to advance from current level to the next
+        next_step = 5 * (level ** 2) + 50 * level + 100
+        if total_xp < xp_for_level(level + 1):
+            return level
+        level += 1
+        # Safety cap — no one reaches level 1000 in practice
+        if level >= 1000:
+            return level
+
+
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
@@ -221,8 +272,37 @@ class ModminBot(commands.Bot):
         intents = discord.Intents.default()
         intents.members = True  # needed for accurate role member counts & bans
         super().__init__(command_prefix="!", intents=intents, help_command=None)
+        # Shared aiosqlite connection; set in setup_hook, closed in close().
+        self.db: Optional[aiosqlite.Connection] = None
 
     async def setup_hook(self) -> None:
+        # Open the XP database and ensure tables exist.
+        self.db = await aiosqlite.connect(XP_DB_FILE)
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS user_xp (
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                xp          INTEGER NOT NULL DEFAULT 0,
+                level       INTEGER NOT NULL DEFAULT 0,
+                last_xp_at  TEXT,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS guild_xp_config (
+                guild_id           INTEGER PRIMARY KEY,
+                enabled            INTEGER NOT NULL DEFAULT 1,
+                xp_min             INTEGER NOT NULL DEFAULT 15,
+                xp_max             INTEGER NOT NULL DEFAULT 25,
+                cooldown_secs      INTEGER NOT NULL DEFAULT 60,
+                level_up_channel_id INTEGER
+            )
+        """)
+        await self.db.commit()
+        log.info("XP database ready at %s", XP_DB_FILE)
+
         if DEV_GUILD_ID:
             guild = discord.Object(id=DEV_GUILD_ID)
             self.tree.copy_global_to(guild=guild)
@@ -231,6 +311,12 @@ class ModminBot(commands.Bot):
         else:
             await self.tree.sync()
             log.info("Synced commands globally")
+
+    async def close(self) -> None:
+        if self.db is not None:
+            await self.db.close()
+            log.info("XP database connection closed")
+        await super().close()
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)
@@ -296,6 +382,153 @@ def save_panic_state(state: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# XP helpers — DB access
+# --------------------------------------------------------------------------- #
+
+
+async def _get_guild_xp_config(db: aiosqlite.Connection, guild_id: int) -> aiosqlite.Row:
+    """Return the guild XP config row, lazily inserting defaults if absent."""
+    async with db.execute(
+        "SELECT * FROM guild_xp_config WHERE guild_id = ?", (guild_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        await db.execute(
+            "INSERT OR IGNORE INTO guild_xp_config (guild_id) VALUES (?)", (guild_id,)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT * FROM guild_xp_config WHERE guild_id = ?", (guild_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    return row
+
+
+async def _get_user_xp_row(
+    db: aiosqlite.Connection, guild_id: int, user_id: int
+) -> aiosqlite.Row:
+    """Return the user_xp row, lazily inserting a zero row if absent."""
+    async with db.execute(
+        "SELECT * FROM user_xp WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        await db.execute(
+            "INSERT OR IGNORE INTO user_xp (guild_id, user_id) VALUES (?, ?)",
+            (guild_id, user_id),
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT * FROM user_xp WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ) as cur:
+            row = await cur.fetchone()
+    return row
+
+
+# --------------------------------------------------------------------------- #
+# on_message — award XP
+# --------------------------------------------------------------------------- #
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    """Award XP for messages, respecting per-guild config and per-user cooldown."""
+    # Ignore bots (including ourselves) and DMs.
+    if message.author.bot or message.guild is None:
+        return
+
+    db = bot.db
+    if db is None:
+        return  # DB not yet ready (startup race guard)
+
+    guild_id = message.guild.id
+    user_id = message.author.id
+
+    try:
+        config = await _get_guild_xp_config(db, guild_id)
+        if not config["enabled"]:
+            return
+
+        xp_min: int = config["xp_min"]
+        xp_max: int = config["xp_max"]
+        cooldown_secs: int = config["cooldown_secs"]
+        level_up_channel_id: Optional[int] = config["level_up_channel_id"]
+
+        # Cooldown check — compare UTC timestamps stored as ISO-8601 strings.
+        row = await _get_user_xp_row(db, guild_id, user_id)
+        if row["last_xp_at"] is not None:
+            last = datetime.fromisoformat(row["last_xp_at"])
+            if (utcnow() - last).total_seconds() < cooldown_secs:
+                return  # still on cooldown
+
+        # Award XP.
+        gained = random.randint(xp_min, xp_max)
+        new_xp = row["xp"] + gained
+        old_level = row["level"]
+        new_level = level_for_xp(new_xp)
+        now_iso = utcnow().isoformat()
+
+        await db.execute(
+            """
+            INSERT INTO user_xp (guild_id, user_id, xp, level, last_xp_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                xp         = excluded.xp,
+                level      = excluded.level,
+                last_xp_at = excluded.last_xp_at
+            """,
+            (guild_id, user_id, new_xp, new_level, now_iso),
+        )
+        await db.commit()
+
+        # Level-up announcement (public, best-effort).
+        if new_level > old_level:
+            await _announce_level_up(message, new_level, level_up_channel_id)
+
+    except Exception as exc:
+        log.warning("XP award failed for user %s in guild %s: %s", user_id, guild_id, exc)
+
+
+async def _announce_level_up(
+    message: discord.Message, new_level: int, level_up_channel_id: Optional[int]
+) -> None:
+    """Post a public level-up message. Best-effort; swallows all HTTP errors."""
+    guild = message.guild
+    member = message.author
+
+    # Resolve the destination channel.
+    dest: Optional[discord.TextChannel] = None
+    if level_up_channel_id:
+        ch = guild.get_channel(level_up_channel_id)
+        if isinstance(ch, discord.TextChannel):
+            dest = ch
+    if dest is None:
+        # Fall back to the channel where the message was sent.
+        if isinstance(message.channel, discord.TextChannel):
+            dest = message.channel
+
+    if dest is None:
+        return
+
+    # Check bot can send there.
+    if not dest.permissions_for(guild.me).send_messages:
+        return
+
+    try:
+        embed = discord.Embed(
+            description=f"🎉 {member.mention} reached **level {new_level}**!",
+            color=discord.Color.gold(),
+            timestamp=utcnow(),
+        )
+        if member.display_avatar:
+            embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"{guild.name} XP System")
+        await dest.send(embed=embed)
+    except discord.HTTPException as exc:
+        log.warning("Level-up announcement failed: %s", exc)
+
+
+# --------------------------------------------------------------------------- #
 # /help
 # --------------------------------------------------------------------------- #
 
@@ -324,6 +557,20 @@ COMMAND_HELP = [
         "Find the user(s) behind an app/bot — the integration installer and/or "
         "whoever invoked a user-installed app to post — so you can ban them.",
     ),
+    (
+        "/xp-config",
+        "[Admin] Configure the per-guild XP/leveling system: enable/disable, "
+        "XP range, cooldown, and level-up announcement channel.",
+    ),
+    (
+        "/rank [user]",
+        "[All members] Show a member's current level, XP, XP needed for the next "
+        "level, and their rank in the server.",
+    ),
+    (
+        "/leaderboard",
+        "[All members] Show the top 10 members by XP in this server.",
+    ),
 ]
 
 
@@ -333,13 +580,19 @@ COMMAND_HELP = [
 async def help_command(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="🛡️ Bams Modmin Tools — Commands",
-        description="Every command requires the **Administrator** permission.",
         color=discord.Color.blurple(),
         timestamp=utcnow(),
     )
+    embed.description = (
+        "Most commands require the **Administrator** permission.\n"
+        "Commands marked **[All members]** are open to everyone."
+    )
     for name, desc in COMMAND_HELP:
         embed.add_field(name=name, value=desc, inline=False)
-    embed.set_footer(text="Actions are logged to #mod-logs if that channel exists.")
+    embed.set_footer(
+        text="Admin actions are logged to #mod-logs if that channel exists. "
+        "XP view commands (/rank, /leaderboard) are open to all members."
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -992,6 +1245,271 @@ async def trace_app(
     embed.set_footer(text=f"Scanned {scanned_channels} channel(s) • by {interaction.user}")
     await interaction.followup.send(embed=embed, ephemeral=True)
     await send_mod_log(guild, embed)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 7: XP / Leveling — admin config
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="xp-config",
+    description="View or update the XP/leveling config for this server.",
+)
+@app_commands.describe(
+    enabled="Enable or disable XP earning in this server.",
+    xp_min="Minimum XP awarded per message (default 15).",
+    xp_max="Maximum XP awarded per message (default 25).",
+    cooldown_secs="Seconds between XP awards per user (default 60).",
+    level_up_channel="Channel for level-up announcements (leave blank to use the message channel).",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=True)
+async def xp_config(
+    interaction: discord.Interaction,
+    enabled: Optional[bool] = None,
+    xp_min: Optional[int] = None,
+    xp_max: Optional[int] = None,
+    cooldown_secs: Optional[int] = None,
+    level_up_channel: Optional[discord.TextChannel] = None,
+) -> None:
+    guild = interaction.guild
+    if guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    # Load current config (lazy-inserts defaults if needed).
+    cfg = await _get_guild_xp_config(db, guild.id)
+
+    # Determine effective values — supplied args override the current config.
+    eff_enabled = (1 if enabled else 0) if enabled is not None else cfg["enabled"]
+    eff_xp_min = xp_min if xp_min is not None else cfg["xp_min"]
+    eff_xp_max = xp_max if xp_max is not None else cfg["xp_max"]
+    eff_cooldown = cooldown_secs if cooldown_secs is not None else cfg["cooldown_secs"]
+    eff_channel_id = (
+        level_up_channel.id if level_up_channel is not None else cfg["level_up_channel_id"]
+    )
+
+    # Validate.
+    errors: list[str] = []
+    if eff_xp_min < 0:
+        errors.append("xp_min must be >= 0.")
+    if eff_xp_max < 0:
+        errors.append("xp_max must be >= 0.")
+    if eff_xp_min > eff_xp_max:
+        errors.append("xp_min must be <= xp_max.")
+    if eff_cooldown < 0:
+        errors.append("cooldown_secs must be >= 0.")
+    if errors:
+        await interaction.followup.send(
+            "❌ Invalid configuration:\n" + "\n".join(f"• {e}" for e in errors),
+            ephemeral=True,
+        )
+        return
+
+    # Upsert.
+    await db.execute(
+        """
+        INSERT INTO guild_xp_config
+            (guild_id, enabled, xp_min, xp_max, cooldown_secs, level_up_channel_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            enabled             = excluded.enabled,
+            xp_min              = excluded.xp_min,
+            xp_max              = excluded.xp_max,
+            cooldown_secs       = excluded.cooldown_secs,
+            level_up_channel_id = excluded.level_up_channel_id
+        """,
+        (guild.id, eff_enabled, eff_xp_min, eff_xp_max, eff_cooldown, eff_channel_id),
+    )
+    await db.commit()
+
+    channel_display = (
+        f"<#{eff_channel_id}>" if eff_channel_id else "message channel (fallback)"
+    )
+    embed = discord.Embed(
+        title=f"XP Config — {guild.name}",
+        color=discord.Color.green() if eff_enabled else discord.Color.greyple(),
+        timestamp=utcnow(),
+    )
+    embed.add_field(name="Enabled", value="Yes" if eff_enabled else "No")
+    embed.add_field(name="XP per message", value=f"{eff_xp_min}–{eff_xp_max}")
+    embed.add_field(name="Cooldown", value=f"{eff_cooldown}s")
+    embed.add_field(name="Level-up channel", value=channel_display, inline=False)
+    embed.set_footer(text=f"Updated by {interaction.user}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # Audit log.
+    await send_mod_log(guild, embed)
+
+
+# --------------------------------------------------------------------------- #
+# Feature 7: XP / Leveling — /rank (open to all members)
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="rank",
+    description="Show a member's level, XP, and server rank.",
+)
+@app_commands.describe(user="The member to look up (default: yourself).")
+async def rank(
+    interaction: discord.Interaction, user: Optional[discord.Member] = None
+) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    target = user or interaction.user
+    guild = interaction.guild
+    guild_id = guild.id
+    user_id = target.id
+
+    await interaction.response.defer(thinking=False)  # Public response
+
+    try:
+        row = await _get_user_xp_row(db, guild_id, user_id)
+        total_xp: int = row["xp"]
+        level: int = row["level"]
+
+        # XP progress within the current level.
+        xp_at_current = xp_for_level(level)
+        xp_at_next = xp_for_level(level + 1)
+        xp_into_level = total_xp - xp_at_current
+        xp_needed = xp_at_next - xp_at_current
+
+        # Server rank: count users with more XP than this user.
+        async with db.execute(
+            "SELECT COUNT(*) FROM user_xp WHERE guild_id = ? AND xp > ?",
+            (guild_id, total_xp),
+        ) as cur:
+            above = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT COUNT(*) FROM user_xp WHERE guild_id = ?",
+            (guild_id,),
+        ) as cur:
+            total_members_with_xp = (await cur.fetchone())[0]
+
+        rank_pos = above + 1
+
+        embed = discord.Embed(
+            title=f"Rank — {target.display_name}",
+            color=target.color if target.color != discord.Color.default() else discord.Color.blurple(),
+            timestamp=utcnow(),
+        )
+        if target.display_avatar:
+            embed.set_thumbnail(url=target.display_avatar.url)
+
+        embed.add_field(name="Level", value=str(level))
+        embed.add_field(name="Total XP", value=f"{total_xp:,}")
+        embed.add_field(name="Server Rank", value=f"#{rank_pos} of {total_members_with_xp}")
+        embed.add_field(
+            name="Progress to next level",
+            value=f"{xp_into_level:,} / {xp_needed:,} XP",
+            inline=False,
+        )
+        embed.set_footer(text=guild.name)
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as exc:
+        log.warning("rank command failed for user %s: %s", user_id, exc)
+        await interaction.followup.send(
+            "❌ Something went wrong fetching rank data. Please try again.", ephemeral=True
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Feature 7: XP / Leveling — /leaderboard (open to all members)
+# --------------------------------------------------------------------------- #
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Show the top 10 members by XP in this server.",
+)
+async def leaderboard(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.", ephemeral=True
+        )
+        return
+
+    db = bot.db
+    if db is None:
+        await interaction.response.send_message(
+            "❌ Database is not ready yet. Please try again in a moment.", ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+
+    await interaction.response.defer(thinking=False)  # Public response
+
+    try:
+        async with db.execute(
+            """
+            SELECT user_id, xp, level
+            FROM user_xp
+            WHERE guild_id = ? AND xp > 0
+            ORDER BY xp DESC
+            LIMIT 10
+            """,
+            (guild.id,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        if not rows:
+            await interaction.followup.send(
+                "No XP data yet — members earn XP by chatting!", ephemeral=False
+            )
+            return
+
+        MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines: list[str] = []
+        for pos, row in enumerate(rows, start=1):
+            medal = MEDALS.get(pos, f"**#{pos}**")
+            member = guild.get_member(row["user_id"])
+            name = member.display_name if member else f"User {row['user_id']}"
+            lines.append(
+                f"{medal} **{name}** — Level {row['level']} · {row['xp']:,} XP"
+            )
+
+        embed = discord.Embed(
+            title=f"🏆 XP Leaderboard — {guild.name}",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+            timestamp=utcnow(),
+        )
+        embed.set_footer(text="Earn XP by chatting in the server!")
+        await interaction.followup.send(embed=embed)
+
+    except Exception as exc:
+        log.warning("leaderboard command failed in guild %s: %s", guild.id, exc)
+        await interaction.followup.send(
+            "❌ Something went wrong fetching leaderboard data. Please try again.",
+            ephemeral=True,
+        )
 
 
 # --------------------------------------------------------------------------- #

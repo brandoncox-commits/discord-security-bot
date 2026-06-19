@@ -1,5 +1,8 @@
 .env
 panic_state.json
+xp.db
+xp.db-wal
+xp.db-shm
 __pycache__/
 *.pyc
 .venv/
