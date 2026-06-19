@@ -2161,7 +2161,7 @@ async def leaderboard(interaction: discord.Interaction) -> None:
 
 @bot.tree.command(
     name="twitch-setup",
-    description="[Server owner only] Start the consent handshake to link a Twitch channel (owner must type !approve-xp in chat).",
+    description="[Server owner only] Link a Twitch channel — channel owner must type !approve-xp in chat.",
 )
 @app_commands.describe(
     channel="The Twitch channel login name (e.g. 'shroud', NOT the URL)."
